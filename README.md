@@ -46,35 +46,37 @@ cargo install --path .
 ### Initial Setup
 
 ```bash
-# Initialize stax in your repository
+# Navigate to your Git repository
+cd your-project
+
+# Initialize stax (works with or without GitHub remote)
 stax init
 ```
+
+**Prerequisites:**
+- Must be run in a Git repository (`git init` if needed)
+- GitHub remote is optional but recommended (`git remote add origin https://github.com/username/repo.git`)
 
 Stax will guide you through authentication setup with two options:
 
 1. **Browser Authentication (Recommended)**: Authenticate through your browser using OAuth
 2. **Personal Access Token**: Manually enter a GitHub personal access token
 
-#### Setting up OAuth Authentication (for developers)
+#### OAuth Authentication Details
 
-If you want to enable OAuth authentication for your users, you need to set up a GitHub OAuth App:
+Stax uses GitHub's device flow for authentication, which is designed specifically for CLI applications:
 
-1. Go to [GitHub Developer Settings](https://github.com/settings/applications/new)
-2. Create a new OAuth App with:
-   - **Application name**: `Stax CLI` (or your preferred name)
-   - **Homepage URL**: `https://github.com/yourusername/stax` (your repository)
-   - **Authorization callback URL**: `http://localhost:8080/callback`
-3. Update `src/oauth.rs` with your app's credentials:
-   ```rust
-   client_id: "your_actual_client_id".to_string(),
-   client_secret: "your_actual_client_secret".to_string(),
-   ```
+1. **No local server required** - Works from any environment including remote servers
+2. **Secure** - Uses the same OAuth client ID as GitHub CLI
+3. **User-friendly** - Simple web-based authorization flow
 
-For production deployments, these credentials should be loaded from environment variables:
-```bash
-export STAX_GITHUB_CLIENT_ID="your_client_id"
-export STAX_GITHUB_CLIENT_SECRET="your_client_secret"
-```
+The authentication process:
+1. Stax requests a device code from GitHub
+2. User visits GitHub's device activation page
+3. User enters the provided code to authorize the application
+4. Stax receives the access token automatically
+
+No additional setup is required - the OAuth flow works out of the box!
 
 ### Basic Commands
 
@@ -257,9 +259,8 @@ src/
 - `anyhow` - Error handling
 - `colored` - Terminal colors
 - `dialoguer` - Interactive prompts
-- `reqwest` - HTTP client for OAuth
+- `reqwest` - HTTP client for OAuth device flow
 - `webbrowser` - Open browser for authentication
-- `tiny_http` - Local server for OAuth callback
 - `dirs` - Directory paths for secure token storage
 
 ### Development Dependencies

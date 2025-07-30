@@ -13,10 +13,27 @@ pub async fn run() -> Result<()> {
     
     let mut config = Config::load()?;
     
-    let remote_url = git.get_remote_url("origin")
-        .map_err(|_| anyhow!("No 'origin' remote found. Please add a GitHub remote first."))?;
+    // Check for GitHub remote (optional)
+    let remote_url = git.get_remote_url("origin").ok();
     
-    utils::print_info(&format!("Detected repository: {remote_url}"));
+    if let Some(url) = &remote_url {
+        utils::print_info(&format!("Detected repository: {url}"));
+    } else {
+        utils::print_warning("No 'origin' remote found.");
+        utils::print_info("You can add a GitHub remote later with:");
+        utils::print_info("  git remote add origin https://github.com/username/repo.git");
+        utils::print_info("");
+        
+        let continue_setup = Confirm::new()
+            .with_prompt("Continue setup without GitHub remote?")
+            .default(true)
+            .interact()?;
+            
+        if !continue_setup {
+            utils::print_info("Setup cancelled. Add a GitHub remote and run 'stax init' again.");
+            return Ok(());
+        }
+    }
     
     // Offer authentication options
     let auth_methods = vec![
@@ -32,10 +49,10 @@ pub async fn run() -> Result<()> {
     
     let github_token = match auth_choice {
         0 => {
-            // Browser OAuth authentication
+            // Browser OAuth authentication - works without remote URL
             utils::print_info("Starting browser authentication...");
-            match GitHubClient::new_with_oauth(&remote_url).await {
-                Ok((_, token)) => token,
+            match GitHubClient::authenticate_with_oauth().await {
+                Ok(token) => token,
                 Err(e) => {
                     utils::print_error(&format!("Browser authentication failed: {e}"));
                     utils::print_info("Falling back to manual token entry...");
