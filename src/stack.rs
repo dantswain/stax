@@ -80,11 +80,19 @@ impl Stack {
         let mut relationships = Vec::new();
         let main_branches = ["main", "master", "develop"];
         
+        // Group branches that point to the same commit
+        let mut commit_to_branches: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+        for branch in branches {
+            let commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
+            commit_to_branches.entry(commit).or_default().push(branch.clone());
+        }
+        
         for branch in branches {
             if main_branches.contains(&branch.as_str()) {
                 continue;
             }
 
+            let current_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
             let mut best_parent = None;
             let mut min_distance = usize::MAX;
 
@@ -92,9 +100,15 @@ impl Stack {
                 if branch == potential_parent || main_branches.contains(&potential_parent.as_str()) {
                     continue;
                 }
+                
+                let parent_commit = git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
+                
+                // Skip if both branches point to the same commit (they're siblings, not parent-child)
+                if current_commit == parent_commit {
+                    continue;
+                }
 
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
-                    let parent_commit = git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
                     if merge_base.to_string() == parent_commit {
                         let distance = Self::calculate_commit_distance(git, potential_parent, branch)?;
                         if distance < min_distance {
