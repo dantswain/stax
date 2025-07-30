@@ -1,0 +1,42 @@
+[package]
+name = "stax"
+version = "0.1.0"
+edition = "2021"
+description = "A fast CLI tool for managing stacked pull requests"
+license = "MIT"
+repository = "https://github.com/yourusername/stax"
+readme = "README.md"
+keywords = ["git", "github", "cli", "stack", "pr"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "stax"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "color"] }
+git2 = { version = "0.18", default-features = false, features = ["vendored-openssl"] }
+octocrab = "0.34"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+colored = "2.0"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+dirs = "5.0"
+url = "2.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+assert_cmd = "2.0"
+predicates = "3.0"
+mockall = "0.12"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
