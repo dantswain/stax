@@ -36,6 +36,14 @@ impl GitHubClient {
         })
     }
 
+    pub async fn new_with_oauth(repo_url: &str) -> Result<(Self, String)> {
+        let oauth_client = crate::oauth::OAuthClient::new();
+        let token = oauth_client.authenticate().await?;
+        let github_client = Self::new(&token, repo_url)?;
+        Ok((github_client, token))
+    }
+
+
     pub async fn get_pull_requests(&self) -> Result<Vec<PullRequest>> {
         let page = self
             .octocrab

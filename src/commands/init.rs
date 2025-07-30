@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use dialoguer::{Input, Select, Confirm};
 use crate::config::Config;
 use crate::git::GitRepo;
+use crate::github::GitHubClient;
+use crate::token_store::TokenStore;
 use crate::utils;
 
 pub async fn run() -> Result<()> {
@@ -11,20 +13,63 @@ pub async fn run() -> Result<()> {
     
     let mut config = Config::load()?;
     
-    let github_token = Input::<String>::new()
-        .with_prompt("GitHub personal access token")
-        .interact_text()?;
-    
-    if github_token.trim().is_empty() {
-        return Err(anyhow!("GitHub token is required"));
-    }
-    
-    config.set("github_token", &github_token)?;
-    
     let remote_url = git.get_remote_url("origin")
         .map_err(|_| anyhow!("No 'origin' remote found. Please add a GitHub remote first."))?;
     
     utils::print_info(&format!("Detected repository: {remote_url}"));
+    
+    // Offer authentication options
+    let auth_methods = vec![
+        "Authenticate with browser (recommended)",
+        "Enter personal access token manually"
+    ];
+    
+    let auth_choice = Select::new()
+        .with_prompt("How would you like to authenticate with GitHub?")
+        .items(&auth_methods)
+        .default(0)
+        .interact()?;
+    
+    let github_token = match auth_choice {
+        0 => {
+            // Browser OAuth authentication
+            utils::print_info("Starting browser authentication...");
+            match GitHubClient::new_with_oauth(&remote_url).await {
+                Ok((_, token)) => token,
+                Err(e) => {
+                    utils::print_error(&format!("Browser authentication failed: {e}"));
+                    utils::print_info("Falling back to manual token entry...");
+                    
+                    let token = Input::<String>::new()
+                        .with_prompt("GitHub personal access token")
+                        .interact_text()?;
+                    
+                    if token.trim().is_empty() {
+                        return Err(anyhow!("GitHub token is required"));
+                    }
+                    
+                    token
+                }
+            }
+        },
+        1 => {
+            // Manual token entry
+            let token = Input::<String>::new()
+                .with_prompt("GitHub personal access token")
+                .interact_text()?;
+            
+            if token.trim().is_empty() {
+                return Err(anyhow!("GitHub token is required"));
+            }
+            
+            token
+        },
+        _ => return Err(anyhow!("Invalid authentication method selected")),
+    };
+    
+    // Store token securely instead of in config
+    TokenStore::store_token(&github_token)?;
+    utils::print_success("GitHub token stored securely");
     
     let base_branches = vec!["main", "master", "develop"];
     let default_selection = base_branches.iter().position(|&x| x == "main").unwrap_or(0);

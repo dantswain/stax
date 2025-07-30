@@ -5,7 +5,9 @@ mod commands;
 mod config;
 mod git;
 mod github;
+mod oauth;
 mod stack;
+mod token_store;
 mod utils;
 
 use commands::*;

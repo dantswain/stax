@@ -48,9 +48,32 @@ cargo install --path .
 ```bash
 # Initialize stax in your repository
 stax init
+```
 
-# Configure GitHub token (required for PR operations)
-stax config set github.token YOUR_GITHUB_TOKEN
+Stax will guide you through authentication setup with two options:
+
+1. **Browser Authentication (Recommended)**: Authenticate through your browser using OAuth
+2. **Personal Access Token**: Manually enter a GitHub personal access token
+
+#### Setting up OAuth Authentication (for developers)
+
+If you want to enable OAuth authentication for your users, you need to set up a GitHub OAuth App:
+
+1. Go to [GitHub Developer Settings](https://github.com/settings/applications/new)
+2. Create a new OAuth App with:
+   - **Application name**: `Stax CLI` (or your preferred name)
+   - **Homepage URL**: `https://github.com/yourusername/stax` (your repository)
+   - **Authorization callback URL**: `http://localhost:8080/callback`
+3. Update `src/oauth.rs` with your app's credentials:
+   ```rust
+   client_id: "your_actual_client_id".to_string(),
+   client_secret: "your_actual_client_secret".to_string(),
+   ```
+
+For production deployments, these credentials should be loaded from environment variables:
+```bash
+export STAX_GITHUB_CLIENT_ID="your_client_id"
+export STAX_GITHUB_CLIENT_SECRET="your_client_secret"
 ```
 
 ### Basic Commands
@@ -234,6 +257,10 @@ src/
 - `anyhow` - Error handling
 - `colored` - Terminal colors
 - `dialoguer` - Interactive prompts
+- `reqwest` - HTTP client for OAuth
+- `webbrowser` - Open browser for authentication
+- `tiny_http` - Local server for OAuth callback
+- `dirs` - Directory paths for secure token storage
 
 ### Development Dependencies
 - `tempfile` - Temporary files for testing
