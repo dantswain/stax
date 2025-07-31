@@ -21,20 +21,20 @@ pub fn print_warning(msg: &str) {
 pub fn confirm(msg: &str) -> Result<bool> {
     print!("{} {} (y/N): ", "?".cyan().bold(), msg);
     io::stdout().flush()?;
-    
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    
+
     Ok(input.trim().to_lowercase() == "y" || input.trim().to_lowercase() == "yes")
 }
 
 pub fn prompt(msg: &str) -> Result<String> {
     print!("{} {}: ", "?".cyan().bold(), msg);
     io::stdout().flush()?;
-    
+
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
-    
+
     Ok(input.trim().to_string())
 }
 

@@ -1,17 +1,17 @@
-use anyhow::Result;
 use crate::git::GitRepo;
 use crate::utils;
+use anyhow::Result;
 
 pub async fn run(name: Option<&str>) -> Result<()> {
     let git = GitRepo::open(".")?;
-    
+
     if !git.is_clean()? {
         utils::print_warning("Working directory has uncommitted changes");
         if !utils::confirm("Continue anyway?")? {
             return Ok(());
         }
     }
-    
+
     let branch_name = match name {
         Some(name) => name.to_string(),
         None => {
@@ -23,14 +23,14 @@ pub async fn run(name: Option<&str>) -> Result<()> {
             input
         }
     };
-    
+
     let current_branch = git.current_branch()?;
-    
+
     git.create_branch(&branch_name, Some(&format!("refs/heads/{current_branch}")))?;
     git.checkout_branch(&branch_name)?;
-    
+
     utils::print_success(&format!("Created and switched to branch '{branch_name}'"));
     utils::print_info(&format!("Parent branch: {current_branch}"));
-    
+
     Ok(())
 }

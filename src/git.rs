@@ -112,11 +112,11 @@ impl GitRepo {
 
         let mut callbacks = RemoteCallbacks::new();
 
-        if is_http_url(&url) {
-            log::debug!("Setting up HTTPS callbacks for remote: {}", url);
+        if is_http_url(url) {
+            log::debug!("Setting up HTTPS callbacks for remote: {url}");
             setup_https_callbacks(&mut callbacks)?;
         } else {
-            log::debug!("Setting up SSH callbacks for remote: {}", url);
+            log::debug!("Setting up SSH callbacks for remote: {url}");
             setup_ssh_callbacks(&mut callbacks)?;
         }
 
@@ -124,11 +124,11 @@ impl GitRepo {
         push_options.remote_callbacks(callbacks);
 
         let refspec = if force {
-            format!("+refs/heads/{}:refs/heads/{}", branch_name, branch_name)
+            format!("+refs/heads/{branch_name}:refs/heads/{branch_name}")
         } else {
-            format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name)
+            format!("refs/heads/{branch_name}:refs/heads/{branch_name}")
         };
-        log::debug!("Pushing branch '{}' with refspec '{}'", branch_name, refspec);
+        log::debug!("Pushing branch '{branch_name}' with refspec '{refspec}'");
         remote.push(&[&refspec], Some(&mut push_options))?;
         Ok(())
     }
@@ -154,9 +154,9 @@ fn setup_ssh_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
     callbacks.credentials(|url, username, allowed_types| {
         let username = username.unwrap_or("git");
 
-        log::debug!("Setting up SSH credentials for URL: {}", url);
-        log::debug!("Setting up SSH credentials for user: {}", username);
-        log::debug!("Allowed credential types: {:?}", allowed_types);
+        log::debug!("Setting up SSH credentials for URL: {url}");
+        log::debug!("Setting up SSH credentials for user: {username}");
+        log::debug!("Allowed credential types: {allowed_types:?}");
 
         if !allowed_types.contains(git2::CredentialType::SSH_KEY) {
             return Err(git2::Error::from_str("SSH key authentication not allowed"));
@@ -193,7 +193,7 @@ fn try_ssh_keys(username: &str) -> Result<Cred, git2::Error> {
 
     for key_name in &["id_rsa", "id_ed25519", "id_ecdsa"] {
         let private_key = ssh_dir.join(key_name);
-        let public_key = ssh_dir.join(format!("{}.pub", key_name));
+        let public_key = ssh_dir.join(format!("{key_name}.pub"));
 
         log::debug!("Checking for private key: {}", private_key.display());
 
@@ -231,12 +231,11 @@ fn setup_https_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
     Ok(())
 }
 
-
 fn get_github_token_from_config() -> Result<String, git2::Error> {
     // Try to read from git config
     let config = git2::Config::open_default()
         .map_err(|_| git2::Error::from_str("Cannot open git config"))?;
-    
+
     // Check common config keys where users might store tokens
     for key in &["github.token", "credential.github.com.username"] {
         if let Ok(token) = config.get_string(key) {
@@ -245,7 +244,7 @@ fn get_github_token_from_config() -> Result<String, git2::Error> {
             }
         }
     }
-    
+
     Err(git2::Error::from_str("No token found in git config"))
 }
 

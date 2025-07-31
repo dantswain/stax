@@ -1,9 +1,9 @@
-pub mod init;
 pub mod branch;
+pub mod config;
+pub mod delete;
+pub mod init;
+pub mod restack;
 pub mod stack;
+pub mod status;
 pub mod submit;
 pub mod sync;
-pub mod restack;
-pub mod delete;
-pub mod status;
-pub mod config;
