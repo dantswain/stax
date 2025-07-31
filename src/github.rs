@@ -28,7 +28,7 @@ impl GitHubClient {
             .build()?;
 
         let (owner, repo) = parse_github_url(repo_url)?;
-        
+
         Ok(GitHubClient {
             octocrab,
             owner,
@@ -112,7 +112,7 @@ impl GitHubClient {
     ) -> Result<PullRequest> {
         let pulls = self.octocrab.pulls(&self.owner, &self.repo);
         let mut update = pulls.update(number);
-        
+
         if let Some(title) = title {
             update = update.title(title);
         }
@@ -165,9 +165,12 @@ fn parse_github_url(url: &str) -> Result<(String, String)> {
         return Err(anyhow!("Not a GitHub URL"));
     }
 
-    let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
+    let path = parsed
+        .path()
+        .trim_start_matches('/')
+        .trim_end_matches(".git");
     let parts: Vec<&str> = path.split('/').collect();
-    
+
     if parts.len() != 2 {
         return Err(anyhow!("Invalid GitHub repository URL format"));
     }
@@ -271,12 +274,12 @@ mod tests {
         // Test that it can be serialized to JSON (for debugging/logging)
         let json = serde_json::to_string(&pr);
         assert!(json.is_ok());
-        
+
         // Test that it can be deserialized back
         let json_str = json.unwrap();
         let deserialized: Result<PullRequest, _> = serde_json::from_str(&json_str);
         assert!(deserialized.is_ok());
-        
+
         let pr2 = deserialized.unwrap();
         assert_eq!(pr.number, pr2.number);
         assert_eq!(pr.title, pr2.title);

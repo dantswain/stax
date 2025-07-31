@@ -113,8 +113,10 @@ impl GitRepo {
         let mut callbacks = RemoteCallbacks::new();
 
         if is_http_url(&url) {
+            log::debug!("Setting up HTTPS callbacks for remote: {}", url);
             setup_https_callbacks(&mut callbacks)?;
         } else {
+            log::debug!("Setting up SSH callbacks for remote: {}", url);
             setup_ssh_callbacks(&mut callbacks)?;
         }
 
@@ -126,6 +128,7 @@ impl GitRepo {
         } else {
             format!("refs/heads/{}:refs/heads/{}", branch_name, branch_name)
         };
+        log::debug!("Pushing branch '{}' with refspec '{}'", branch_name, refspec);
         remote.push(&[&refspec], Some(&mut push_options))?;
         Ok(())
     }
@@ -148,23 +151,31 @@ fn is_http_url(url: &str) -> bool {
 
 fn setup_ssh_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
     // Configure SSH callbacks if needed
-    callbacks.credentials(|_url, username, allowed_types| {
+    callbacks.credentials(|url, username, allowed_types| {
         let username = username.unwrap_or("git");
+
+        log::debug!("Setting up SSH credentials for URL: {}", url);
+        log::debug!("Setting up SSH credentials for user: {}", username);
+        log::debug!("Allowed credential types: {:?}", allowed_types);
 
         if !allowed_types.contains(git2::CredentialType::SSH_KEY) {
             return Err(git2::Error::from_str("SSH key authentication not allowed"));
         }
 
-        // ssh agent
-        if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
+        // NOTE in the future this should support ssh agent, but the below causes
+        //   a loop when I test it
+        /* if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
+            log::debug!("Using SSH key from agent for user: {}", username);
             return Ok(cred);
         }
+        */
 
         // fall back to ssh keys
         try_ssh_keys(username)
     });
 
     callbacks.certificate_check(|_cert, _valid| {
+        log::debug!("Certificate check callback called");
         Ok(git2::CertificateCheckStatus::CertificateOk)
     });
 
@@ -178,9 +189,13 @@ fn try_ssh_keys(username: &str) -> Result<Cred, git2::Error> {
 
     let ssh_dir = std::path::Path::new(&home).join(".ssh");
 
+    log::debug!("Looking for SSH keys in: {}", ssh_dir.display());
+
     for key_name in &["id_rsa", "id_ed25519", "id_ecdsa"] {
         let private_key = ssh_dir.join(key_name);
         let public_key = ssh_dir.join(format!("{}.pub", key_name));
+
+        log::debug!("Checking for private key: {}", private_key.display());
 
         if private_key.exists() {
             if let Ok(cred) = Cred::ssh_key(username, Some(&public_key), &private_key, None) {

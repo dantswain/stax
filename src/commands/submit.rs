@@ -5,21 +5,32 @@ use dialoguer::{theme::ColorfulTheme, Input, Confirm};
 pub async fn run(all: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
+
+    log::debug!("Opening git repository");
     
     // Check if we have a GitHub token
     let token = token_store::get_token()
         .ok_or_else(|| anyhow!("No GitHub token found. Run 'stax init' to authenticate first."))?;
+
+    log::debug!("Using GitHub token: {}", token);
     
     // Get the remote URL for GitHub client
     let remote_url = git.get_remote_url("origin")
         .ok_or_else(|| anyhow!("No 'origin' remote found. Add a GitHub remote first."))?;
     
+    log::debug!("Github remote URL: {}", remote_url);
+
     let github = GitHubClient::new(&token, &remote_url)?;
+
+    log::debug!("Analyzing stack structure");
+
     let stack = Stack::analyze(&git, Some(&github)).await?;
-    
+
     if all {
+        log::debug!("Submitting all branches in stack...");
         submit_stack(&git, &github, &stack, &config).await
     } else {
+        log::debug!("Submitting current branch...");
         submit_current_branch(&git, &github, &stack, &config).await
     }
 }

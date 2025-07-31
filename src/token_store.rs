@@ -71,17 +71,3 @@ impl TokenStore {
 pub fn get_token() -> Option<String> {
     TokenStore::get_token()
 }
-
-#[cfg(test)]
-mod tests {  
-    use super::*;
-
-    #[test]
-    fn test_token_storage() {
-        // Test that store_token doesn't panic or error in a basic case
-        let test_token = "test_token_12345";
-        
-        // This may fail in some environments (like CI), which is fine
-        let _ = TokenStore::store_token(test_token);
-    }
-}

@@ -30,6 +30,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
 reqwest = { version = "0.11", features = ["json"] }
 webbrowser = "0.8"
+log = "0.4"
+env_logger = "0.11"
 
 [dev-dependencies]
 tempfile = "3.8"
