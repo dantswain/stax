@@ -11,6 +11,7 @@ pub struct Config {
     pub auto_push: bool,
     pub draft_prs: bool,
     pub pr_template: Option<String>,
+    #[serde(default)]
     pub user_settings: HashMap<String, String>,
 }
 

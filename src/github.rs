@@ -74,7 +74,6 @@ impl GitHubClient {
         Ok(prs.into_iter().find(|pr| pr.head_ref == branch))
     }
 
-    #[allow(dead_code)]
     pub async fn create_pull_request(
         &self,
         title: &str,
@@ -104,7 +103,6 @@ impl GitHubClient {
         })
     }
 
-    #[allow(dead_code)]
     pub async fn update_pull_request(
         &self,
         number: u64,

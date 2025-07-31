@@ -55,7 +55,21 @@ impl TokenStore {
         Ok(())
     }
 
+    /// Retrieve a stored GitHub token
+    pub fn get_token() -> Option<String> {
+        let token_path = Self::get_token_path().ok()?;
+        
+        if token_path.exists() {
+            fs::read_to_string(token_path).ok().map(|s| s.trim().to_string())
+        } else {
+            None
+        }
+    }
+}
 
+/// Convenience function to get the stored token
+pub fn get_token() -> Option<String> {
+    TokenStore::get_token()
 }
 
 #[cfg(test)]

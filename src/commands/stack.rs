@@ -11,8 +11,11 @@ pub async fn run() -> Result<()> {
     let config = Config::load()?;
     
     let github_client = if let Some(token) = &config.github_token {
-        let remote_url = git.get_remote_url("origin")?;
-        Some(GitHubClient::new(token, &remote_url)?)
+        if let Some(remote_url) = git.get_remote_url("origin") {
+            Some(GitHubClient::new(token, &remote_url)?)
+        } else {
+            None
+        }
     } else {
         None
     };

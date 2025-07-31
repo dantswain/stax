@@ -14,7 +14,7 @@ pub async fn run() -> Result<()> {
     let mut config = Config::load()?;
     
     // Check for GitHub remote (optional)
-    let remote_url = git.get_remote_url("origin").ok();
+    let remote_url = git.get_remote_url("origin");
     
     if let Some(url) = &remote_url {
         utils::print_info(&format!("Detected repository: {url}"));
