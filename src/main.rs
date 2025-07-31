@@ -26,7 +26,7 @@ enum Commands {
     #[command(about = "Setup configuration")]
     Init,
     #[command(about = "Create new branch")]
-    Branch { name: String },
+    Branch { name: Option<String> },
     #[command(about = "Show visual stack structure")]
     Stack,
     #[command(about = "Create/update PRs")]
@@ -69,7 +69,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Init => init::run().await,
-        Commands::Branch { name } => branch::run(&name).await,
+        Commands::Branch { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,
         Commands::Sync { all } => sync::run(all).await,

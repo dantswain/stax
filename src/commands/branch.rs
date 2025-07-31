@@ -2,7 +2,7 @@ use anyhow::Result;
 use crate::git::GitRepo;
 use crate::utils;
 
-pub async fn run(name: &str) -> Result<()> {
+pub async fn run(name: Option<&str>) -> Result<()> {
     let git = GitRepo::open(".")?;
     
     if !git.is_clean()? {
@@ -12,12 +12,24 @@ pub async fn run(name: &str) -> Result<()> {
         }
     }
     
+    let branch_name = match name {
+        Some(name) => name.to_string(),
+        None => {
+            let input = utils::prompt("Enter branch name")?;
+            if input.is_empty() {
+                utils::print_error("Branch name cannot be empty");
+                return Ok(());
+            }
+            input
+        }
+    };
+    
     let current_branch = git.current_branch()?;
     
-    git.create_branch(name, Some(&format!("refs/heads/{current_branch}")))?;
-    git.checkout_branch(name)?;
+    git.create_branch(&branch_name, Some(&format!("refs/heads/{current_branch}")))?;
+    git.checkout_branch(&branch_name)?;
     
-    utils::print_success(&format!("Created and switched to branch '{name}'"));
+    utils::print_success(&format!("Created and switched to branch '{branch_name}'"));
     utils::print_info(&format!("Parent branch: {current_branch}"));
     
     Ok(())

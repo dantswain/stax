@@ -28,6 +28,16 @@ pub fn confirm(msg: &str) -> Result<bool> {
     Ok(input.trim().to_lowercase() == "y" || input.trim().to_lowercase() == "yes")
 }
 
+pub fn prompt(msg: &str) -> Result<String> {
+    print!("{} {}: ", "?".cyan().bold(), msg);
+    io::stdout().flush()?;
+    
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    
+    Ok(input.trim().to_string())
+}
+
 #[allow(dead_code)]
 pub fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
