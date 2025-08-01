@@ -72,7 +72,7 @@ impl Config {
         
         if let Some(template) = &self.pr_template {
             content.push_str("# Default PR template\n");
-            content.push_str(&format!("pr_template = \"\"\"\n{template}\n\"\"\"\n"));
+            content.push_str(&format!("pr_template = '''\n{template}\n\'''\n"));
             content.push('\n');
         }
         
@@ -208,7 +208,7 @@ mod tests {
         // Check that values are correct
         assert!(toml_content.contains("default_base_branch = \"develop\""));
         assert!(toml_content.contains("auto_push = false"));
-        assert!(toml_content.contains("pr_template = \"\"\""));
+        assert!(toml_content.contains("pr_template = '''"));
         assert!(toml_content.contains("[user_settings]"));
         assert!(toml_content.contains("custom_key = \"custom_value\""));
     }
