@@ -176,3 +176,112 @@ fn parse_github_url(url: &str) -> Result<(String, String)> {
 
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_github_url_https() {
+        let result = parse_github_url("https://github.com/user/repo.git");
+        assert!(result.is_ok());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "user");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_url_https_no_git() {
+        let result = parse_github_url("https://github.com/user/repo");
+        assert!(result.is_ok());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "user");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_url_ssh() {
+        let result = parse_github_url("git@github.com:user/repo.git");
+        assert!(result.is_ok());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "user");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_url_ssh_no_git() {
+        let result = parse_github_url("git@github.com:user/repo");
+        assert!(result.is_ok());
+        let (owner, repo) = result.unwrap();
+        assert_eq!(owner, "user");
+        assert_eq!(repo, "repo");
+    }
+
+    #[test]
+    fn test_parse_github_url_invalid_host() {
+        let result = parse_github_url("https://gitlab.com/user/repo.git");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_github_url_invalid_format() {
+        let result = parse_github_url("https://github.com/user");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_github_url_invalid_ssh() {
+        let result = parse_github_url("git@gitlab.com:user/repo.git");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pull_request_struct() {
+        let pr = PullRequest {
+            number: 42,
+            title: "Test PR".to_string(),
+            body: Some("Test body".to_string()),
+            state: "open".to_string(),
+            head_ref: "feature-branch".to_string(),
+            base_ref: "main".to_string(),
+            html_url: "https://github.com/user/repo/pull/42".to_string(),
+            draft: false,
+        };
+
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.title, "Test PR");
+        assert_eq!(pr.body, Some("Test body".to_string()));
+        assert_eq!(pr.state, "open");
+        assert_eq!(pr.head_ref, "feature-branch");
+        assert_eq!(pr.base_ref, "main");
+        assert!(!pr.draft);
+    }
+
+    #[test]
+    fn test_pull_request_serialization() {
+        let pr = PullRequest {
+            number: 42,
+            title: "Test PR".to_string(),
+            body: None,
+            state: "draft".to_string(),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            html_url: "https://github.com/user/repo/pull/42".to_string(),
+            draft: true,
+        };
+
+        // Test that it can be serialized to JSON (for debugging/logging)
+        let json = serde_json::to_string(&pr);
+        assert!(json.is_ok());
+        
+        // Test that it can be deserialized back
+        let json_str = json.unwrap();
+        let deserialized: Result<PullRequest, _> = serde_json::from_str(&json_str);
+        assert!(deserialized.is_ok());
+        
+        let pr2 = deserialized.unwrap();
+        assert_eq!(pr.number, pr2.number);
+        assert_eq!(pr.title, pr2.title);
+        assert_eq!(pr.draft, pr2.draft);
+    }
+}
