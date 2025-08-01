@@ -12,8 +12,6 @@ pub async fn run(all: bool) -> Result<()> {
     let token = token_store::get_token()
         .ok_or_else(|| anyhow!("No GitHub token found. Run 'stax init' to authenticate first."))?;
 
-    log::debug!("Using GitHub token: {token}");
-
     // Get the remote URL for GitHub client
     let remote_url = git
         .get_remote_url("origin")

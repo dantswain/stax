@@ -175,8 +175,8 @@ fn setup_ssh_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
     });
 
     callbacks.certificate_check(|_cert, _valid| {
-        log::debug!("Certificate check callback called");
-        Ok(git2::CertificateCheckStatus::CertificateOk)
+        log::error!("Certificate validation failed");
+        Err(git2::Error::from_str("Invalid certificate"))
     });
 
     Ok(())
@@ -217,12 +217,12 @@ fn setup_https_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
 
         // Try to get GitHub token from config or environment
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            return Cred::userpass_plaintext(&token, "");
+            return Cred::userpass_plaintext(&token, "x-oauth-basic");
         }
 
         // Try to read from git config (requires git2 config reading)
         if let Ok(token) = get_github_token_from_config() {
-            return git2::Cred::userpass_plaintext(&token, "");
+            return git2::Cred::userpass_plaintext(&token, "x-oauth-basic");
         }
 
         Err(git2::Error::from_str("No HTTPS credentials found"))
