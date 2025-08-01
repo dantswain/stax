@@ -64,7 +64,7 @@ impl OAuthClient {
         println!("  1. Visit: {}", device_response.verification_uri);
         println!("  2. Enter code: {}", device_response.user_code);
         println!();
-        
+
         crate::utils::print_info("Opening browser automatically...");
         if let Err(e) = webbrowser::open(&device_response.verification_uri) {
             crate::utils::print_warning(&format!("Failed to open browser: {e}"));
@@ -98,7 +98,10 @@ impl OAuthClient {
             .await?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("Failed to request device code: {}", response.status()));
+            return Err(anyhow!(
+                "Failed to request device code: {}",
+                response.status()
+            ));
         }
 
         let device_response: DeviceCodeResponse = response.json().await?;
@@ -133,7 +136,10 @@ impl OAuthClient {
                 .await?;
 
             if !response.status().is_success() {
-                return Err(anyhow!("Failed to poll for access token: {}", response.status()));
+                return Err(anyhow!(
+                    "Failed to poll for access token: {}",
+                    response.status()
+                ));
             }
 
             let token_response: AccessTokenResponse = response.json().await?;
@@ -160,7 +166,8 @@ impl OAuthClient {
                         return Err(anyhow!("Authorization was denied."));
                     }
                     _ => {
-                        let description = token_response.error_description
+                        let description = token_response
+                            .error_description
                             .as_deref()
                             .unwrap_or("Unknown error");
                         return Err(anyhow!("Authorization failed: {} - {}", error, description));
@@ -204,7 +211,7 @@ mod tests {
             client_id: "test_client".to_string(),
             scope: "repo".to_string(),
         };
-        
+
         assert_eq!(request.client_id, "test_client");
         assert_eq!(request.scope, "repo");
     }
@@ -216,9 +223,12 @@ mod tests {
             device_code: "test_code".to_string(),
             grant_type: "urn:ietf:params:oauth:grant-type:device_code".to_string(),
         };
-        
+
         assert_eq!(request.client_id, "test_client");
         assert_eq!(request.device_code, "test_code");
-        assert_eq!(request.grant_type, "urn:ietf:params:oauth:grant-type:device_code");
+        assert_eq!(
+            request.grant_type,
+            "urn:ietf:params:oauth:grant-type:device_code"
+        );
     }
 }

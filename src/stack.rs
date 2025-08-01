@@ -1,7 +1,7 @@
-use anyhow::Result;
-use std::collections::{HashMap, HashSet};
 use crate::git::GitRepo;
 use crate::github::{GitHubClient, PullRequest};
+use anyhow::Result;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct StackBranch {
@@ -25,10 +25,10 @@ impl Stack {
     pub async fn analyze(git: &GitRepo, github: Option<&GitHubClient>) -> Result<Self> {
         let branches = git.get_branches()?;
         let current_branch = git.current_branch()?;
-        
+
         let mut stack_branches = HashMap::new();
         let mut prs = HashMap::new();
-        
+
         if let Some(github_client) = github {
             let all_prs = github_client.get_pull_requests().await?;
             for pr in all_prs {
@@ -41,18 +41,21 @@ impl Stack {
             let pull_request = prs.get(branch_name).cloned();
             let is_current = branch_name == &current_branch;
 
-            stack_branches.insert(branch_name.clone(), StackBranch {
-                name: branch_name.clone(),
-                parent: None,
-                children: Vec::new(),
-                commit_hash,
-                pull_request,
-                is_current,
-            });
+            stack_branches.insert(
+                branch_name.clone(),
+                StackBranch {
+                    name: branch_name.clone(),
+                    parent: None,
+                    children: Vec::new(),
+                    commit_hash,
+                    pull_request,
+                    is_current,
+                },
+            );
         }
 
         let relationships = Self::detect_relationships(git, &branches)?;
-        
+
         for (child, parent) in relationships {
             if let Some(child_branch) = stack_branches.get_mut(&child) {
                 child_branch.parent = Some(parent.clone());
@@ -78,7 +81,7 @@ impl Stack {
     fn detect_relationships(git: &GitRepo, branches: &[String]) -> Result<Vec<(String, String)>> {
         let mut relationships = Vec::new();
         let main_branches = ["main", "master", "develop"];
-        
+
         for branch in branches {
             if main_branches.contains(&branch.as_str()) {
                 continue;
@@ -89,12 +92,14 @@ impl Stack {
             let mut min_distance = usize::MAX;
 
             for potential_parent in branches {
-                if branch == potential_parent || main_branches.contains(&potential_parent.as_str()) {
+                if branch == potential_parent || main_branches.contains(&potential_parent.as_str())
+                {
                     continue;
                 }
-                
-                let parent_commit = git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
-                
+
+                let parent_commit =
+                    git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
+
                 // Skip if both branches point to the same commit (they're siblings, not parent-child)
                 if current_commit == parent_commit {
                     continue;
@@ -102,7 +107,8 @@ impl Stack {
 
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
                     if merge_base.to_string() == parent_commit {
-                        let distance = Self::calculate_commit_distance(git, potential_parent, branch)?;
+                        let distance =
+                            Self::calculate_commit_distance(git, potential_parent, branch)?;
                         if distance < min_distance {
                             min_distance = distance;
                             best_parent = Some(potential_parent.clone());
@@ -115,7 +121,10 @@ impl Stack {
                 relationships.push((branch.clone(), parent));
             } else {
                 for main_branch in &main_branches {
-                    if git.get_commit_hash(&format!("refs/heads/{main_branch}")).is_ok() {
+                    if git
+                        .get_commit_hash(&format!("refs/heads/{main_branch}"))
+                        .is_ok()
+                    {
                         relationships.push((branch.clone(), main_branch.to_string()));
                         break;
                     }
@@ -129,7 +138,7 @@ impl Stack {
     fn calculate_commit_distance(git: &GitRepo, from: &str, to: &str) -> Result<usize> {
         let from_commit = git.get_commit_hash(&format!("refs/heads/{from}"))?;
         let to_commit = git.get_commit_hash(&format!("refs/heads/{to}"))?;
-        
+
         if from_commit == to_commit {
             return Ok(0);
         }
@@ -174,7 +183,9 @@ impl Stack {
     pub fn is_stack_clean(&self, branch_name: &str) -> bool {
         let stack = self.get_stack_for_branch(branch_name);
         stack.iter().all(|b| {
-            b.pull_request.as_ref().is_none_or(|pr| pr.state == "open" || pr.state == "draft")
+            b.pull_request
+                .as_ref()
+                .is_none_or(|pr| pr.state == "open" || pr.state == "draft")
         })
     }
 }
@@ -185,7 +196,11 @@ mod tests {
     use crate::github::PullRequest;
     use std::collections::HashMap;
 
-    fn create_test_branch(name: &str, parent: Option<String>, children: Vec<String>) -> StackBranch {
+    fn create_test_branch(
+        name: &str,
+        parent: Option<String>,
+        children: Vec<String>,
+    ) -> StackBranch {
         StackBranch {
             name: name.to_string(),
             parent,
@@ -212,8 +227,14 @@ mod tests {
     #[test]
     fn test_stack_creation() {
         let mut branches = HashMap::new();
-        branches.insert("main".to_string(), create_test_branch("main", None, vec!["feature1".to_string()]));
-        branches.insert("feature1".to_string(), create_test_branch("feature1", Some("main".to_string()), vec![]));
+        branches.insert(
+            "main".to_string(),
+            create_test_branch("main", None, vec!["feature1".to_string()]),
+        );
+        branches.insert(
+            "feature1".to_string(),
+            create_test_branch("feature1", Some("main".to_string()), vec![]),
+        );
 
         let stack = Stack {
             branches,
@@ -230,9 +251,22 @@ mod tests {
     #[test]
     fn test_get_stack_for_branch() {
         let mut branches = HashMap::new();
-        branches.insert("main".to_string(), create_test_branch("main", None, vec!["feature1".to_string()]));
-        branches.insert("feature1".to_string(), create_test_branch("feature1", Some("main".to_string()), vec!["feature2".to_string()]));
-        branches.insert("feature2".to_string(), create_test_branch("feature2", Some("feature1".to_string()), vec![]));
+        branches.insert(
+            "main".to_string(),
+            create_test_branch("main", None, vec!["feature1".to_string()]),
+        );
+        branches.insert(
+            "feature1".to_string(),
+            create_test_branch(
+                "feature1",
+                Some("main".to_string()),
+                vec!["feature2".to_string()],
+            ),
+        );
+        branches.insert(
+            "feature2".to_string(),
+            create_test_branch("feature2", Some("feature1".to_string()), vec![]),
+        );
 
         let stack = Stack {
             branches,
@@ -242,7 +276,7 @@ mod tests {
 
         let stack_branches = stack.get_stack_for_branch("feature2");
         assert!(stack_branches.len() >= 2);
-        
+
         let branch_names: Vec<&str> = stack_branches.iter().map(|b| b.name.as_str()).collect();
         assert!(branch_names.contains(&"feature2"));
     }
@@ -250,7 +284,10 @@ mod tests {
     #[test]
     fn test_is_stack_clean_with_no_prs() {
         let mut branches = HashMap::new();
-        branches.insert("feature1".to_string(), create_test_branch("feature1", None, vec![]));
+        branches.insert(
+            "feature1".to_string(),
+            create_test_branch("feature1", None, vec![]),
+        );
 
         let stack = Stack {
             branches,
@@ -265,7 +302,7 @@ mod tests {
     fn test_is_stack_clean_with_open_pr() {
         let mut branch = create_test_branch("feature1", None, vec![]);
         branch.pull_request = Some(create_test_pr("feature1", "open"));
-        
+
         let mut branches = HashMap::new();
         branches.insert("feature1".to_string(), branch);
 
@@ -282,7 +319,7 @@ mod tests {
     fn test_is_stack_clean_with_closed_pr() {
         let mut branch = create_test_branch("feature1", None, vec![]);
         branch.pull_request = Some(create_test_pr("feature1", "closed"));
-        
+
         let mut branches = HashMap::new();
         branches.insert("feature1".to_string(), branch);
 
