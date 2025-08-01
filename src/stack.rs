@@ -17,7 +17,6 @@ pub struct StackBranch {
 #[derive(Debug)]
 pub struct Stack {
     pub branches: HashMap<String, StackBranch>,
-    #[allow(dead_code)]
     pub roots: Vec<String>,
     pub current_branch: String,
 }
@@ -85,6 +84,7 @@ impl Stack {
                 continue;
             }
 
+            let current_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
             let mut best_parent = None;
             let mut min_distance = usize::MAX;
 
@@ -92,9 +92,15 @@ impl Stack {
                 if branch == potential_parent || main_branches.contains(&potential_parent.as_str()) {
                     continue;
                 }
+                
+                let parent_commit = git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
+                
+                // Skip if both branches point to the same commit (they're siblings, not parent-child)
+                if current_commit == parent_commit {
+                    continue;
+                }
 
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
-                    let parent_commit = git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
                     if merge_base.to_string() == parent_commit {
                         let distance = Self::calculate_commit_distance(git, potential_parent, branch)?;
                         if distance < min_distance {
