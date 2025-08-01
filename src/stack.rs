@@ -17,7 +17,6 @@ pub struct StackBranch {
 #[derive(Debug)]
 pub struct Stack {
     pub branches: HashMap<String, StackBranch>,
-    #[allow(dead_code)]
     pub roots: Vec<String>,
     pub current_branch: String,
 }
@@ -79,13 +78,6 @@ impl Stack {
     fn detect_relationships(git: &GitRepo, branches: &[String]) -> Result<Vec<(String, String)>> {
         let mut relationships = Vec::new();
         let main_branches = ["main", "master", "develop"];
-        
-        // Group branches that point to the same commit
-        let mut commit_to_branches: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-        for branch in branches {
-            let commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
-            commit_to_branches.entry(commit).or_default().push(branch.clone());
-        }
         
         for branch in branches {
             if main_branches.contains(&branch.as_str()) {
