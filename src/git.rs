@@ -130,6 +130,15 @@ impl GitRepo {
         };
         log::debug!("Pushing branch '{branch_name}' with refspec '{refspec}'");
         remote.push(&[&refspec], Some(&mut push_options))?;
+        self.track_branch(branch_name)?;
+        Ok(())
+    }
+
+    fn track_branch(&self, branch_name: &str) -> Result<()> {
+        let mut branch = self.repo.find_branch(branch_name, BranchType::Local)?;
+        let upstream_ref = format!("refs/remotes/origin/{branch_name}");
+        branch.set_upstream(Some(&upstream_ref))?;
+        log::debug!("Tracking remote branch '{upstream_ref}' for local branch '{branch_name}'");
         Ok(())
     }
 
