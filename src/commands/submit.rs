@@ -151,6 +151,8 @@ async fn create_new_pr(
         }
     }
 
+    git.ensure_tracking_branch(branch_name)?;
+
     // Generate title from branch name (convert kebab-case to Title Case)
     let default_title = branch_name
         .replace(['-', '_'], " ")
