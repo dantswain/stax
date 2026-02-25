@@ -9,7 +9,10 @@
       "Bash(cargo test)",
       "Bash(cargo clippy:*)",
       "Bash(find:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(grep:*)",
+      "Bash(git commit:*)"
     ],
     "deny": []
   }

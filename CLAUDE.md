@@ -11,121 +11,59 @@ Stax is a Rust CLI tool for managing stacked pull requests on GitHub. It helps d
 ```bash
 # Build and test
 cargo build                      # Debug build
-cargo build --release          # Optimized release build
-cargo test                      # Run all tests
-cargo test -- --nocapture      # Run tests with output
-cargo test utils                # Test specific module
-cargo test test_truncate_string # Test specific function
+cargo test                       # Run all tests
+cargo test -- --nocapture        # Run tests with output
+cargo test utils                 # Test specific module
+cargo test test_truncate_string  # Test specific function
 
 # Code quality (run before committing)
-cargo clippy -- -D warnings    # Lint with warnings as errors
-cargo fmt --check              # Check formatting
-cargo fmt                       # Apply formatting
+cargo clippy -- -D warnings      # Lint with warnings as errors
+cargo fmt --check                # Check formatting
+cargo fmt                        # Apply formatting
 
 # Installation
-cargo install --path .         # Install locally from source
+cargo install --path .           # Install locally from source
 ```
 
 ## Architecture Overview
 
 ### CLI Structure
 - **Entry Point**: `src/main.rs` uses clap v4 with derive macros for command parsing
-- **Command Routing**: All commands are async functions returning `Result<()>`
-- **Commands Directory**: `src/commands/` contains individual command implementations
-- **Error Handling**: Uses `anyhow::Result` throughout with `?` operator for propagation
-
-### Core Modules
-- **`git.rs`**: Git operations wrapper using `git2` crate for repository management
-- **`github.rs`**: GitHub API client using `octocrab` for PR operations  
-- **`oauth.rs`**: GitHub OAuth device flow implementation (uses GitHub CLI's client ID)
-- **`config.rs`**: TOML-based configuration with XDG directory compliance
-- **`stack.rs`**: Core stack analysis and branch relationship detection
-- **`token_store.rs`**: Secure token storage with Unix file permissions (0o600)
-- **`utils.rs`**: Colored terminal output utilities and interactive prompts
+- **Commands Directory**: `src/commands/` contains individual command implementations, each exposing an async `run()` function
+- **Error Handling**: Uses `anyhow::Result` throughout; errors propagate to `main()` which prints them and exits with code 1
 
 ### Command Architecture Pattern
 All commands follow this pattern:
-1. Load Git repository with `GitRepo::open(".")`
-2. Load configuration from TOML file
-3. Optionally create GitHub client if token available
-4. Perform operations with user feedback via colored output
-5. Return Result for main.rs error handling
+1. Open git repo with `GitRepo::open(".")`
+2. Load `Config` from TOML file
+3. Optionally get GitHub token and create `GitHubClient`
+4. Perform operations with user feedback via `utils::print_*` colored output
+5. Return `Result<()>`
+
+### Core Modules
+- **`git.rs`**: Wraps `git2` crate. `GitRepo` struct provides branch operations, push, merge-base detection. SSH auth tries key files directly (agent auth commented out due to loop issue). HTTPS auth reads `GITHUB_TOKEN` env var or git config.
+- **`github.rs`**: `GitHubClient` wraps `octocrab`. Parses both HTTPS and SSH remote URLs via `parse_github_url()`. Custom `PullRequest` struct (not octocrab's) used throughout.
+- **`stack.rs`**: `Stack::analyze()` builds the branch graph. `detect_relationships()` infers parent-child by checking if a branch's merge-base with another equals that branch's tip (closest such branch wins). Falls back to main/master/develop as parent.
+- **`config.rs`**: TOML config at XDG-compliant paths. Key fields: `default_base_branch`, `auto_push`, `draft_prs`, `pr_template`.
+- **`oauth.rs`**: GitHub device flow auth (uses GitHub CLI's client ID: `178c6fc778ccc68e1d6a`).
+- **`token_store.rs`**: Token stored at `~/.stax/token` with 0o600 permissions.
+- **`utils.rs`**: `print_success/info/warning/error` colored output, `confirm()` prompts via `dialoguer`.
 
 ### Available Commands
 - `stax init` - Interactive setup with OAuth or token authentication
-- `stax branch [name]` - Create branch with parent relationship (prompts if no name)
+- `stax branch [name]` - Create branch with parent relationship tracking
 - `stax stack` - Visual tree display of branch relationships
-- `stax submit [--all]` - PR creation (stub implementation - needs development)
-- `stax sync [--all]` - Remote synchronization
+- `stax submit [--all]` - Create/update PRs; `--all` submits entire stack
+- `stax sync [--all]` - Sync with remote
 - `stax restack [--all]` - Rebase branches on parents
 - `stax delete <branch>` - Delete branch and update dependents
 - `stax status` - Show current repository status
 - `stax config set/get/list` - Configuration management
 
-## Key Dependencies
+## Key Patterns
 
-### Runtime
-- **`clap`** (4.4): CLI parsing with derive macros and color support
-- **`git2`** (0.18): Git operations with vendored OpenSSL
-- **`octocrab`** (0.34): GitHub API client
-- **`tokio`** (1.0): Async runtime with full features
-- **`serde`** + **`toml`**: Configuration serialization
-- **`anyhow`**: Error handling and chaining
-- **`colored`**: Terminal output styling
-- **`dialoguer`**: Interactive prompts with fuzzy selection
-- **`reqwest`**: HTTP client for OAuth device flow
-- **`webbrowser`**: Open browser for authentication
-
-### Development
-- **`tempfile`**: Temporary files for testing
-- **`assert_cmd`**: CLI testing framework
-- **`predicates`**: Test assertions
-- **`mockall`**: Mocking framework
-
-## Configuration & Authentication
-
-### File Locations (XDG compliant)
-- **Config**: `~/.config/stax/config.toml` (Linux/macOS), `%APPDATA%\stax\config.toml` (Windows)
-- **Token**: `~/.stax/token` with 0o600 permissions (Linux/macOS), `%USERPROFILE%\.stax\token` (Windows)
-
-### OAuth Implementation
-- Uses GitHub's device flow (same client ID as GitHub CLI: `178c6fc778ccc68e1d6a`)
-- No local server required - works in any environment
-- Secure browser-based authorization flow
-- Automatic token retrieval and storage
-
-### Setup Requirements
-- Must be run in a Git repository
-- GitHub remote is optional but recommended
-- Supports both HTTPS and SSH remote formats
-
-## Testing Structure
-
-Comprehensive test coverage across modules:
-- **Utils**: String truncation, prompts, colored output edge cases
-- **Git Operations**: Repository operations, branch management
-- **GitHub API**: URL parsing, PR serialization
-- **Configuration**: TOML generation, validation, path resolution
-- **Stack Analysis**: Branch relationships, traversal algorithms
-- **OAuth**: Request structure validation
-
-## Development Notes
-
-### Code Patterns
-- All command functions are async using Tokio runtime
-- Extensive use of `?` operator for error propagation
-- Interactive UX prioritized with confirmation prompts using `dialoguer`
-- Security-conscious token storage with proper Unix permissions
-- Configuration is both programmatic and human-editable
-
-### Current Limitations
-- **Submit command is stubbed** - main missing feature for PR creation
-- Token refresh logic not implemented for OAuth tokens
-- Cross-platform token security needs improvement on Windows
-
-### Build Configuration
-Release profile optimized for CLI distribution:
-- Link-time optimization enabled
-- Single codegen unit
-- Panic abort for smaller binaries
-- Debug symbols stripped
+- All command functions are async (Tokio runtime)
+- Interactive UX via `dialoguer` (confirmations, text input, fuzzy-select)
+- `GitRepo` does not use `git2::Repository::open()` directly — it uses `discover()` which walks up to find the `.git` directory
+- Stack relationship detection is heuristic (merge-base analysis), not stored metadata
+- Main/master/develop are treated as root branches and excluded from PR operations
