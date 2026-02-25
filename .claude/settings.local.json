@@ -14,7 +14,10 @@
       "Bash(grep:*)",
       "Bash(git commit:*)",
       "Bash(cargo test:*)",
-      "Bash(echo exit: $?:*)"
+      "Bash(echo exit: $?:*)",
+      "Bash(which stax 2>&1 && stax stack 2>&1)",
+      "Bash(cargo install:*)",
+      "Bash(stax stack:*)"
     ],
     "deny": []
   }
