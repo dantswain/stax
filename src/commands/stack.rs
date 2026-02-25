@@ -21,18 +21,42 @@ pub async fn run() -> Result<()> {
 
     let stack = Stack::analyze(&git, github_client.as_ref()).await?;
 
+    // Scope to only the current branch's stack (ancestors + descendants)
+    let in_scope: HashSet<String> = stack
+        .get_stack_for_branch(&stack.current_branch)
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+
+    // Find the root of the current branch's stack
+    let mut root = stack.current_branch.as_str();
+    while let Some(branch) = stack.branches.get(root) {
+        match &branch.parent {
+            Some(parent) => root = parent,
+            None => break,
+        }
+    }
+
     println!("{}", "Stack Visualization".bold().underline());
     println!();
 
     let mut visited = HashSet::new();
-    for root in &stack.roots {
-        print_stack_tree(&stack, root, 0, &mut visited);
-    }
+    print_stack_tree(&stack, root, 0, &mut visited, &in_scope);
 
     Ok(())
 }
 
-fn print_stack_tree(stack: &Stack, branch_name: &str, depth: usize, visited: &mut HashSet<String>) {
+fn print_stack_tree(
+    stack: &Stack,
+    branch_name: &str,
+    depth: usize,
+    visited: &mut HashSet<String>,
+    in_scope: &HashSet<String>,
+) {
+    if !in_scope.contains(branch_name) {
+        return;
+    }
+
     if visited.contains(branch_name) {
         let indent = "  ".repeat(depth);
         let connector = if depth > 0 { "├─ " } else { "" };
@@ -74,7 +98,7 @@ fn print_stack_tree(stack: &Stack, branch_name: &str, depth: usize, visited: &mu
         println!("{line}");
 
         for child in &branch.children {
-            print_stack_tree(stack, child, depth + 1, visited);
+            print_stack_tree(stack, child, depth + 1, visited, in_scope);
         }
 
         visited.remove(branch_name);

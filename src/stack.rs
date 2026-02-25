@@ -26,16 +26,56 @@ impl Stack {
         let branches = git.get_branches()?;
         let current_branch = git.current_branch()?;
 
-        let mut stack_branches = HashMap::new();
-        let mut prs = HashMap::new();
+        let main_branches = ["main", "master", "develop"];
 
-        if let Some(github_client) = github {
-            let all_prs = github_client.get_pull_requests().await?;
-            for pr in all_prs {
+        // Fetch first page of open PRs (single request, covers most small/medium repos)
+        // Run concurrently with local git work
+        let bulk_handle = if let Some(gh) = github {
+            let gh = gh.clone();
+            Some(tokio::spawn(
+                async move { gh.get_open_pull_requests().await },
+            ))
+        } else {
+            None
+        };
+
+        // Do expensive local git work while the bulk fetch is in flight
+        let relationships = Self::detect_relationships(git, &branches)?;
+
+        // Collect bulk PR results
+        let mut prs: HashMap<String, PullRequest> = HashMap::new();
+        if let Some(handle) = bulk_handle {
+            for pr in handle.await?? {
                 prs.insert(pr.head_ref.clone(), pr);
             }
         }
 
+        // Find branches still missing PRs and fetch individually in parallel
+        if let Some(gh) = github {
+            let missing: Vec<_> = branches
+                .iter()
+                .filter(|b| !main_branches.contains(&b.as_str()) && !prs.contains_key(*b))
+                .cloned()
+                .collect();
+
+            if !missing.is_empty() {
+                let handles: Vec<_> = missing
+                    .into_iter()
+                    .map(|branch| {
+                        let gh = gh.clone();
+                        tokio::spawn(async move { gh.get_pr_for_branch(&branch).await })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    if let Ok(Some(pr)) = handle.await? {
+                        prs.insert(pr.head_ref.clone(), pr);
+                    }
+                }
+            }
+        }
+
+        let mut stack_branches = HashMap::new();
         for branch_name in &branches {
             let commit_hash = git.get_commit_hash(&format!("refs/heads/{branch_name}"))?;
             let pull_request = prs.get(branch_name).cloned();
@@ -53,8 +93,6 @@ impl Stack {
                 },
             );
         }
-
-        let relationships = Self::detect_relationships(git, &branches)?;
 
         for (child, parent) in relationships {
             if let Some(child_branch) = stack_branches.get_mut(&child) {
