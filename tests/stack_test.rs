@@ -62,28 +62,7 @@ async fn test_analyze_branching_from_main() {
 }
 
 #[tokio::test]
-async fn test_analyze_three_level_stack() {
-    let (dir, repo) = create_test_repo();
-    let p = dir.path();
-
-    // main → A → B  (2-level deep — the heuristic reliably detects this)
-    create_branch_with_commit(p, "A", "main");
-    create_branch_with_commit(p, "B", "A");
-
-    let stack = stax::stack::Stack::analyze(&repo, None).await.unwrap();
-
-    assert_eq!(
-        stack.branches.get("A").unwrap().parent.as_deref(),
-        Some("main")
-    );
-    assert_eq!(
-        stack.branches.get("B").unwrap().parent.as_deref(),
-        Some("A")
-    );
-}
-
-#[tokio::test]
-async fn test_analyze_all_non_main_branches_have_parent() {
+async fn test_analyze_deep_stack() {
     let (dir, repo) = create_test_repo();
     let p = dir.path();
 
@@ -95,25 +74,21 @@ async fn test_analyze_all_non_main_branches_have_parent() {
 
     let stack = stax::stack::Stack::analyze(&repo, None).await.unwrap();
 
-    // Every non-main branch should have a parent assigned
-    for (name, branch) in &stack.branches {
-        if name != "main" {
-            assert!(
-                branch.parent.is_some(),
-                "branch {name} should have a parent"
-            );
-        }
-    }
-
-    // A's parent is definitely main (only candidate after excluding main branches)
     assert_eq!(
         stack.branches.get("A").unwrap().parent.as_deref(),
         Some("main")
     );
-    // B's parent is definitely A (only valid merge-base match)
     assert_eq!(
         stack.branches.get("B").unwrap().parent.as_deref(),
         Some("A")
+    );
+    assert_eq!(
+        stack.branches.get("C").unwrap().parent.as_deref(),
+        Some("B")
+    );
+    assert_eq!(
+        stack.branches.get("D").unwrap().parent.as_deref(),
+        Some("C")
     );
 }
 
@@ -142,19 +117,21 @@ async fn test_get_stack_for_branch_includes_ancestors_and_descendants() {
     let (dir, repo) = create_test_repo();
     let p = dir.path();
 
-    // main → A → B  (2-level chain the heuristic reliably detects)
+    // main → A → B → C
     create_branch_with_commit(p, "A", "main");
     create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
 
     let stack = stax::stack::Stack::analyze(&repo, None).await.unwrap();
 
-    // Get stack from A's perspective — should include main (ancestor) and B (child)
-    let branch_stack = stack.get_stack_for_branch("A");
+    // Get stack from B's perspective — should include full chain
+    let branch_stack = stack.get_stack_for_branch("B");
     let names: Vec<&str> = branch_stack.iter().map(|b| b.name.as_str()).collect();
 
     assert!(names.contains(&"main"), "should include root ancestor");
-    assert!(names.contains(&"A"), "should include the branch itself");
-    assert!(names.contains(&"B"), "should include child");
+    assert!(names.contains(&"A"), "should include parent");
+    assert!(names.contains(&"B"), "should include the branch itself");
+    assert!(names.contains(&"C"), "should include child");
 }
 
 #[tokio::test]

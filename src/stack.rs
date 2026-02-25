@@ -92,8 +92,7 @@ impl Stack {
             let mut min_distance = usize::MAX;
 
             for potential_parent in branches {
-                if branch == potential_parent || main_branches.contains(&potential_parent.as_str())
-                {
+                if branch == potential_parent {
                     continue;
                 }
 
@@ -107,8 +106,10 @@ impl Stack {
 
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
                     if merge_base.to_string() == parent_commit {
-                        let distance =
-                            Self::calculate_commit_distance(git, potential_parent, branch)?;
+                        let distance = git.count_commits_between(
+                            &format!("refs/heads/{potential_parent}"),
+                            &format!("refs/heads/{branch}"),
+                        )?;
                         if distance < min_distance {
                             min_distance = distance;
                             best_parent = Some(potential_parent.clone());
@@ -119,31 +120,10 @@ impl Stack {
 
             if let Some(parent) = best_parent {
                 relationships.push((branch.clone(), parent));
-            } else {
-                for main_branch in &main_branches {
-                    if git
-                        .get_commit_hash(&format!("refs/heads/{main_branch}"))
-                        .is_ok()
-                    {
-                        relationships.push((branch.clone(), main_branch.to_string()));
-                        break;
-                    }
-                }
             }
         }
 
         Ok(relationships)
-    }
-
-    fn calculate_commit_distance(git: &GitRepo, from: &str, to: &str) -> Result<usize> {
-        let from_commit = git.get_commit_hash(&format!("refs/heads/{from}"))?;
-        let to_commit = git.get_commit_hash(&format!("refs/heads/{to}"))?;
-
-        if from_commit == to_commit {
-            return Ok(0);
-        }
-
-        Ok(1)
     }
 
     pub fn get_stack_for_branch(&self, branch_name: &str) -> Vec<&StackBranch> {
@@ -331,20 +311,5 @@ mod tests {
         };
 
         assert!(!stack.is_stack_clean("feature1"));
-    }
-
-    #[test]
-    fn test_calculate_commit_distance_same_commit() {
-        let mut branches = HashMap::new();
-        branches.insert("main".to_string(), create_test_branch("main", None, vec![]));
-
-        let stack = Stack {
-            branches,
-            roots: vec!["main".to_string()],
-            current_branch: "main".to_string(),
-        };
-
-        assert_eq!(stack.branches.len(), 1);
-        assert!(stack.branches.contains_key("main"));
     }
 }

@@ -152,6 +152,44 @@ fn test_get_merge_base_diverged_branches() {
     assert_eq!(merge_base.to_string(), fork_point);
 }
 
+// ── count_commits_between ────────────────────────────────────────────────────
+
+#[test]
+fn test_count_commits_between_linear() {
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    // main (1 commit) → A (1 more) → B (1 more)
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    assert_eq!(
+        repo.count_commits_between("refs/heads/main", "refs/heads/A")
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        repo.count_commits_between("refs/heads/main", "refs/heads/B")
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        repo.count_commits_between("refs/heads/A", "refs/heads/B")
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn test_count_commits_between_same_ref() {
+    let (_dir, repo) = create_test_repo();
+    assert_eq!(
+        repo.count_commits_between("refs/heads/main", "refs/heads/main")
+            .unwrap(),
+        0
+    );
+}
+
 // ── is_clean ─────────────────────────────────────────────────────────────────
 
 #[test]

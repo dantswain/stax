@@ -164,6 +164,19 @@ impl GitRepo {
         Ok(self.repo.merge_base(commit1, commit2)?)
     }
 
+    /// Count commits reachable from `to` but not from `from`.
+    /// Equivalent to `git rev-list --count from..to`.
+    pub fn count_commits_between(&self, from: &str, to: &str) -> Result<usize> {
+        let from_oid = self.repo.revparse_single(from)?.id();
+        let to_oid = self.repo.revparse_single(to)?.id();
+
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.push(to_oid)?;
+        revwalk.hide(from_oid)?;
+
+        Ok(revwalk.count())
+    }
+
     pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
         let workdir = self
             .repo
