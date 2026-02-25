@@ -23,10 +23,23 @@ pub struct Stack {
 
 impl Stack {
     pub async fn analyze(git: &GitRepo, github: Option<&GitHubClient>) -> Result<Self> {
-        let branches = git.get_branches()?;
+        let all_branches = git.get_branches()?;
         let current_branch = git.current_branch()?;
 
         let main_branches = ["main", "master", "develop"];
+
+        // Filter out branches that are fully merged into trunk
+        let trunk = main_branches
+            .iter()
+            .find(|name| all_branches.contains(&name.to_string()))
+            .map(|s| s.to_string());
+        let branches: Vec<String> = all_branches
+            .into_iter()
+            .filter(|b| {
+                main_branches.contains(&b.as_str())
+                    || trunk.as_ref().is_none_or(|t| !is_merged_into(git, b, t))
+            })
+            .collect();
 
         // Fetch first page of open PRs (single request, covers most small/medium repos)
         // Run concurrently with local git work
@@ -120,9 +133,22 @@ impl Stack {
         let mut relationships = Vec::new();
         let main_branches = ["main", "master", "develop"];
 
+        // Find the trunk branch for fallback and merged-branch detection
+        let trunk = main_branches
+            .iter()
+            .find(|name| branches.contains(&name.to_string()))
+            .map(|s| s.to_string());
+
         for branch in branches {
             if main_branches.contains(&branch.as_str()) {
                 continue;
+            }
+
+            // Skip branches that are fully merged into trunk
+            if let Some(ref trunk_name) = trunk {
+                if is_merged_into(git, branch, trunk_name) {
+                    continue;
+                }
             }
 
             let current_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
@@ -142,6 +168,15 @@ impl Stack {
                     continue;
                 }
 
+                // Skip non-trunk branches whose tip is an ancestor of trunk (they're merged)
+                if !main_branches.contains(&potential_parent.as_str()) {
+                    if let Some(ref trunk_name) = trunk {
+                        if is_merged_into(git, potential_parent, trunk_name) {
+                            continue;
+                        }
+                    }
+                }
+
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
                     if merge_base.to_string() == parent_commit {
                         let distance = git.count_commits_between(
@@ -153,6 +188,13 @@ impl Stack {
                             best_parent = Some(potential_parent.clone());
                         }
                     }
+                }
+            }
+
+            // Fall back to trunk if no parent detected
+            if best_parent.is_none() {
+                if let Some(ref trunk_name) = trunk {
+                    best_parent = Some(trunk_name.clone());
                 }
             }
 
@@ -206,6 +248,17 @@ impl Stack {
                 .as_ref()
                 .is_none_or(|pr| pr.state == "open" || pr.state == "draft")
         })
+    }
+}
+
+/// Check if a branch is fully merged into trunk
+/// (its tip is an ancestor of trunk's tip).
+fn is_merged_into(git: &GitRepo, branch: &str, trunk: &str) -> bool {
+    let branch_hash = git.get_commit_hash(&format!("refs/heads/{branch}")).ok();
+    let merge_base = git.get_merge_base(branch, trunk).ok();
+    match (branch_hash, merge_base) {
+        (Some(bh), Some(mb)) => bh == mb.to_string(),
+        _ => false,
     }
 }
 
