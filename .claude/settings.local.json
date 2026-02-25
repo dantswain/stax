@@ -12,7 +12,8 @@
       "Bash(ls:*)",
       "Bash(cargo fmt:*)",
       "Bash(grep:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(cargo test:*)"
     ],
     "deny": []
   }
