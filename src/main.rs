@@ -23,8 +23,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Setup configuration")]
-    Init,
+    #[command(about = "Authenticate with GitHub")]
+    Auth {
+        #[command(subcommand)]
+        command: Option<AuthCommands>,
+    },
     #[command(about = "Create new branch")]
     Branch { name: Option<String> },
     #[command(about = "Show visual stack structure")]
@@ -54,6 +57,14 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+pub enum AuthCommands {
+    #[command(about = "Log in to GitHub")]
+    Login,
+    #[command(about = "Show current authentication status")]
+    Status,
+}
+
+#[derive(Subcommand)]
 enum ConfigCommands {
     #[command(about = "Set configuration value")]
     Set { key: String, value: String },
@@ -69,7 +80,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Init => init::run().await,
+        Commands::Auth { command } => auth::run(command).await,
         Commands::Branch { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,

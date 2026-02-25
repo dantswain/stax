@@ -6,7 +6,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub github_token: Option<String>,
     pub default_base_branch: String,
     pub auto_push: bool,
     pub draft_prs: bool,
@@ -18,7 +17,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            github_token: None,
             default_base_branch: "main".to_string(),
             auto_push: true,
             draft_prs: false,
@@ -93,7 +91,11 @@ impl Config {
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
-            "github_token" => self.github_token = Some(value.to_string()),
+            "github_token" => {
+                return Err(anyhow!(
+                    "GitHub token is managed by 'stax auth', not config. Run 'stax auth login' to authenticate."
+                ));
+            }
             "default_base_branch" => self.default_base_branch = value.to_string(),
             "auto_push" => self.auto_push = value.parse()?,
             "draft_prs" => self.draft_prs = value.parse()?,
@@ -108,7 +110,6 @@ impl Config {
 
     pub fn get(&self, key: &str) -> Option<String> {
         match key {
-            "github_token" => self.github_token.clone(),
             "default_base_branch" => Some(self.default_base_branch.clone()),
             "auto_push" => Some(self.auto_push.to_string()),
             "draft_prs" => Some(self.draft_prs.to_string()),
@@ -120,9 +121,6 @@ impl Config {
     pub fn list(&self) -> HashMap<String, String> {
         let mut settings = HashMap::new();
 
-        if let Some(token) = &self.github_token {
-            settings.insert("github_token".to_string(), mask_token(token));
-        }
         settings.insert(
             "default_base_branch".to_string(),
             self.default_base_branch.clone(),
@@ -152,7 +150,6 @@ mod tests {
         assert_eq!(config.default_base_branch, "main");
         assert!(config.auto_push);
         assert!(!config.draft_prs);
-        assert!(config.github_token.is_none());
         assert!(config.pr_template.is_none());
         assert!(config.user_settings.is_empty());
     }
@@ -282,14 +279,6 @@ fn get_preferred_config_dir() -> Result<PathBuf> {
     dirs::config_dir().ok_or_else(|| anyhow!("Could not determine config directory"))
 }
 
-fn mask_token(token: &str) -> String {
-    if token.len() > 8 {
-        format!("{}...{}", &token[..4], &token[token.len() - 4..])
-    } else {
-        "***".to_string()
-    }
-}
-
 pub mod commands {
     use super::*;
     use crate::utils;
@@ -298,14 +287,7 @@ pub mod commands {
         let mut config = Config::load()?;
         config.set(key, value)?;
         config.save()?;
-        utils::print_success(&format!(
-            "Set {key} = {}",
-            if key == "github_token" {
-                mask_token(value)
-            } else {
-                value.to_string()
-            }
-        ));
+        utils::print_success(&format!("Set {key} = {value}"));
         Ok(())
     }
 

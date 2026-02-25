@@ -36,6 +36,11 @@ impl GitHubClient {
         })
     }
 
+    pub async fn get_authenticated_user(&self) -> Result<String> {
+        let user = self.octocrab.current().user().await?;
+        Ok(user.login)
+    }
+
     pub async fn authenticate_with_oauth() -> Result<String> {
         let oauth_client = crate::oauth::OAuthClient::new();
         oauth_client.authenticate().await

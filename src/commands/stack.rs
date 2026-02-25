@@ -1,18 +1,17 @@
-use crate::config::Config;
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
 use crate::stack::Stack;
+use crate::token_store;
 use anyhow::Result;
 use colored::*;
 use std::collections::HashSet;
 
 pub async fn run() -> Result<()> {
     let git = GitRepo::open(".")?;
-    let config = Config::load()?;
 
-    let github_client = if let Some(token) = &config.github_token {
+    let github_client = if let Some(token) = token_store::get_token() {
         if let Some(remote_url) = git.get_remote_url("origin") {
-            Some(GitHubClient::new(token, &remote_url)?)
+            GitHubClient::new(&token, &remote_url).ok()
         } else {
             None
         }

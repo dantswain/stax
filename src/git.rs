@@ -57,6 +57,7 @@ impl GitRepo {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_branch_upstream(&self, branch_name: &str) -> Result<Option<String>> {
         let branch = self.repo.find_branch(branch_name, BranchType::Local)?;
         if let Ok(upstream) = branch.upstream() {

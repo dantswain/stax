@@ -180,6 +180,7 @@ impl Stack {
         stack
     }
 
+    #[allow(dead_code)]
     pub fn is_stack_clean(&self, branch_name: &str) -> bool {
         let stack = self.get_stack_for_branch(branch_name);
         stack.iter().all(|b| {

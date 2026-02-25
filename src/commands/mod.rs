@@ -1,7 +1,7 @@
+pub mod auth;
 pub mod branch;
 pub mod config;
 pub mod delete;
-pub mod init;
 pub mod restack;
 pub mod stack;
 pub mod status;
