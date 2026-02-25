@@ -1,16 +1,9 @@
 use clap::{Parser, Subcommand};
 use std::process;
 
-mod commands;
-mod config;
-mod git;
-mod github;
-mod oauth;
-mod stack;
-mod token_store;
-mod utils;
-
-use commands::*;
+use stax::commands;
+use stax::commands::*;
+use stax::AuthCommands;
 
 #[derive(Parser)]
 #[command(name = "stax")]
@@ -54,14 +47,6 @@ enum Commands {
     #[command(about = "Manage configuration")]
     #[command(subcommand)]
     Config(ConfigCommands),
-}
-
-#[derive(Subcommand)]
-pub enum AuthCommands {
-    #[command(about = "Log in to GitHub")]
-    Login,
-    #[command(about = "Show current authentication status")]
-    Status,
 }
 
 #[derive(Subcommand)]

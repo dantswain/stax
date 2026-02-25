@@ -43,6 +43,12 @@ pub struct OAuthClient {
     client: Client,
 }
 
+impl Default for OAuthClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OAuthClient {
     pub fn new() -> Self {
         Self {

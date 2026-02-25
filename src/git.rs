@@ -163,6 +163,34 @@ impl GitRepo {
         let commit2 = self.repo.revparse_single(branch2)?.id();
         Ok(self.repo.merge_base(commit1, commit2)?)
     }
+
+    pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
+        let workdir = self
+            .repo
+            .workdir()
+            .ok_or_else(|| anyhow!("Cannot determine working directory"))?;
+
+        let output = std::process::Command::new("git")
+            .args(["rebase", onto, branch])
+            .current_dir(workdir)
+            .output()?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // Rebase failed — abort to clean up
+        let _ = std::process::Command::new("git")
+            .args(["rebase", "--abort"])
+            .current_dir(workdir)
+            .output();
+
+        Err(anyhow!(
+            "Rebase of '{}' onto '{}' failed due to conflicts",
+            branch,
+            onto
+        ))
+    }
 }
 
 fn is_http_url(url: &str) -> bool {
