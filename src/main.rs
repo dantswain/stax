@@ -32,8 +32,10 @@ enum Commands {
     },
     #[command(about = "Sync with remote")]
     Sync {
-        #[arg(long, help = "Sync all branches in stack")]
-        all: bool,
+        #[arg(long, help = "Skip restacking branches")]
+        no_restack: bool,
+        #[arg(short, long, help = "Skip confirmation prompts")]
+        force: bool,
     },
     #[command(about = "Rebase branches on parents")]
     Restack {
@@ -69,7 +71,7 @@ async fn main() {
         Commands::Branch { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,
-        Commands::Sync { all } => sync::run(all).await,
+        Commands::Sync { no_restack, force } => sync::run(no_restack, force).await,
         Commands::Restack { all } => restack::run(all).await,
         Commands::Delete { branch } => delete::run(&branch).await,
         Commands::Status => status::run().await,

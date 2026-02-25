@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use git2::{BranchType, Cred, Oid, PushOptions, RemoteCallbacks, Repository};
+use git2::{BranchType, Cred, FetchOptions, Oid, PushOptions, RemoteCallbacks, Repository};
 use std::path::Path;
 
 pub struct GitRepo {
@@ -203,6 +203,110 @@ impl GitRepo {
             branch,
             onto
         ))
+    }
+
+    pub fn fetch(&self) -> Result<()> {
+        let mut remote = self.repo.find_remote("origin")?;
+        let url = remote
+            .url()
+            .ok_or_else(|| anyhow!("Remote 'origin' has no URL"))?;
+
+        let mut callbacks = RemoteCallbacks::new();
+        if is_http_url(url) {
+            setup_https_callbacks(&mut callbacks)?;
+        } else {
+            setup_ssh_callbacks(&mut callbacks)?;
+        }
+
+        let mut fetch_options = FetchOptions::new();
+        fetch_options.remote_callbacks(callbacks);
+
+        remote.fetch(&[] as &[&str], Some(&mut fetch_options), None)?;
+        Ok(())
+    }
+
+    /// Fast-forward a local branch to match its remote tracking branch.
+    /// Returns Ok(true) if the branch was updated, Ok(false) if already up to date.
+    pub fn fast_forward_branch(&self, branch_name: &str) -> Result<bool> {
+        let local_ref_name = format!("refs/heads/{branch_name}");
+        let remote_ref_name = format!("refs/remotes/origin/{branch_name}");
+
+        let local_ref = match self.repo.find_reference(&local_ref_name) {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        let remote_ref = match self.repo.find_reference(&remote_ref_name) {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+
+        let local_oid = local_ref
+            .target()
+            .ok_or_else(|| anyhow!("Local ref has no target"))?;
+        let remote_oid = remote_ref
+            .target()
+            .ok_or_else(|| anyhow!("Remote ref has no target"))?;
+
+        if local_oid == remote_oid {
+            return Ok(false);
+        }
+
+        // Check that remote is a descendant of local (i.e. fast-forward is safe)
+        if !self.repo.graph_descendant_of(remote_oid, local_oid)? {
+            return Err(anyhow!(
+                "Cannot fast-forward '{}': remote has diverged",
+                branch_name
+            ));
+        }
+
+        // Move the local ref forward
+        self.repo.reference(
+            &local_ref_name,
+            remote_oid,
+            true,
+            &format!("stax: fast-forward {branch_name}"),
+        )?;
+
+        // If this branch is currently checked out, update the working directory too
+        if let Ok(head) = self.repo.head() {
+            if head.name() == Some(&local_ref_name) {
+                let obj = self.repo.find_object(remote_oid, None)?;
+                self.repo
+                    .checkout_tree(&obj, Some(git2::build::CheckoutBuilder::new().force()))?;
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Delete a local branch and optionally its remote counterpart.
+    pub fn delete_branch(&self, branch_name: &str, delete_remote: bool) -> Result<()> {
+        // Delete local branch
+        let mut branch = self.repo.find_branch(branch_name, BranchType::Local)?;
+        branch.delete()?;
+
+        // Delete remote branch if requested and it exists
+        if delete_remote && self.has_remote_branch(branch_name)? {
+            let mut remote = self.repo.find_remote("origin")?;
+            let url = remote
+                .url()
+                .ok_or_else(|| anyhow!("Remote 'origin' has no URL"))?;
+
+            let mut callbacks = RemoteCallbacks::new();
+            if is_http_url(url) {
+                setup_https_callbacks(&mut callbacks)?;
+            } else {
+                setup_ssh_callbacks(&mut callbacks)?;
+            }
+
+            let mut push_options = PushOptions::new();
+            push_options.remote_callbacks(callbacks);
+
+            let refspec = format!(":refs/heads/{branch_name}");
+            remote.push(&[&refspec], Some(&mut push_options))?;
+        }
+
+        Ok(())
     }
 }
 
