@@ -49,8 +49,8 @@ cargo install --path .
 # Navigate to your Git repository
 cd your-project
 
-# Initialize stax (works with or without GitHub remote)
-stax init
+# Authenticate with GitHub
+stax auth login
 ```
 
 **Prerequisites:**
@@ -240,34 +240,32 @@ cargo fmt
 
 ## Testing Coverage
 
-The project includes comprehensive unit tests covering:
+The project includes 75+ tests across unit and integration suites:
 
-- **Utility Functions** (`src/utils.rs`):
-  - String truncation with various edge cases
-  - User confirmation prompts
-  - Colored output functions
+- **Unit Tests** (in-module `#[cfg(test)]`):
+  - `config.rs` — Config defaults, set/get, TOML generation, path resolution
+  - `github.rs` — URL parsing (SSH/HTTPS), PR struct serialization
+  - `stack.rs` — Stack creation, branch traversal, PR state validation
+  - `utils.rs` — String truncation edge cases
+  - `oauth.rs` — Client creation, request structure validation
 
-- **Stack Management** (`src/stack.rs`):
-  - Stack creation and validation
-  - Branch relationship detection
-  - Pull request state management
-  - Stack traversal algorithms
-
-- **Integration Tests**:
-  - Command-line interface testing with `assert_cmd`
-  - File system operations with `tempfile`
-  - Predicate testing with `predicates`
+- **Integration Tests** (`tests/`):
+  - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (24 tests using temp repos with bare remote origins)
+  - `stack_test.rs` — `Stack::analyze` with various topologies: linear, branching, diamond (12 async tests)
+  - `restack_test.rs` — `rebase_onto` simple/noop/conflict/full-stack/branch-preservation (5 tests)
+  - `token_store_test.rs` — Token store/retrieve, overwrite, whitespace trimming, unix file permissions (5 tests)
 
 ## Project Structure
 
 ```
 src/
 ├── main.rs              # CLI entry point and command routing
+├── lib.rs               # Library crate root (public module exports)
 ├── commands/            # Command implementations
+│   ├── auth.rs          # GitHub authentication (login/status)
 │   ├── branch.rs        # Branch creation
 │   ├── config.rs        # Configuration management
 │   ├── delete.rs        # Branch deletion
-│   ├── init.rs          # Repository initialization
 │   ├── restack.rs       # Branch restacking
 │   ├── stack.rs         # Stack visualization
 │   ├── status.rs        # Status display
@@ -276,8 +274,16 @@ src/
 ├── config.rs            # Configuration handling
 ├── git.rs               # Git operations wrapper
 ├── github.rs            # GitHub API integration
+├── oauth.rs             # GitHub device flow OAuth
 ├── stack.rs             # Stack analysis and management
+├── token_store.rs       # Secure token storage (~/.stax/token)
 └── utils.rs             # Utility functions
+tests/
+├── common/mod.rs        # Shared test helpers (temp repo creation)
+├── git_test.rs          # Git operations integration tests
+├── restack_test.rs      # Rebase integration tests
+├── stack_test.rs        # Stack analysis integration tests
+└── token_store_test.rs  # Token storage integration tests
 ```
 
 ## Dependencies
