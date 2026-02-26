@@ -22,7 +22,7 @@ enum Commands {
         command: Option<AuthCommands>,
     },
     #[command(about = "Create new branch")]
-    Branch { name: Option<String> },
+    Create { name: Option<String> },
     #[command(about = "Show visual stack structure")]
     Stack,
     #[command(about = "Create/update PRs")]
@@ -78,7 +78,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Auth { command } => auth::run(command).await,
-        Commands::Branch { name } => branch::run(name.as_deref()).await,
+        Commands::Create { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,
         Commands::Sync {
