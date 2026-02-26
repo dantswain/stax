@@ -9,7 +9,13 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
         return continue_after_conflicts(&git, &config).await;
     }
 
-    // 1. Guard — abort if working tree is dirty
+    // 1. Guard — abort if rebase in progress or working tree is dirty
+    if git.is_rebase_in_progress() {
+        return Err(anyhow!(
+            "A rebase is currently in progress.\n\
+             Resolve conflicts and run 'stax sync --continue', or 'git rebase --abort' to cancel."
+        ));
+    }
     if !git.is_clean()? {
         return Err(anyhow!(
             "Working directory has uncommitted changes. Please commit or stash them first."

@@ -17,6 +17,12 @@ pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
         return Box::pin(run(true, false)).await;
     }
 
+    if git.is_rebase_in_progress() {
+        return Err(anyhow!(
+            "A rebase is currently in progress.\n\
+             Resolve conflicts and run 'stax restack --continue', or 'git rebase --abort' to cancel."
+        ));
+    }
     if !git.is_clean()? {
         return Err(anyhow!(
             "Working directory has uncommitted changes. Please commit or stash them first."
