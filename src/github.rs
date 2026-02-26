@@ -15,6 +15,7 @@ pub struct PullRequest {
     pub draft: bool,
 }
 
+#[derive(Clone)]
 pub struct GitHubClient {
     octocrab: Octocrab,
     owner: String,
@@ -46,37 +47,76 @@ impl GitHubClient {
         oauth_client.authenticate().await
     }
 
-    pub async fn get_pull_requests(&self) -> Result<Vec<PullRequest>> {
+    /// Fetch the first page of open PRs (up to 100). Sufficient for most repos.
+    pub async fn get_open_pull_requests(&self) -> Result<Vec<PullRequest>> {
+        let page = self
+            .octocrab
+            .pulls(&self.owner, &self.repo)
+            .list()
+            .state(octocrab::params::State::Open)
+            .per_page(100)
+            .send()
+            .await?;
+
+        Ok(page
+            .into_iter()
+            .map(|pr| PullRequest {
+                number: pr.number,
+                title: pr.title.unwrap_or_default(),
+                body: pr.body,
+                state: if pr.merged_at.is_some() {
+                    "merged".to_string()
+                } else {
+                    format!("{:?}", pr.state.unwrap()).to_lowercase()
+                },
+                head_ref: pr.head.ref_field,
+                base_ref: pr.base.ref_field,
+                html_url: pr.html_url.unwrap().to_string(),
+                draft: pr.draft.unwrap_or(false),
+            })
+            .collect())
+    }
+
+    /// Fetch the most recent PR for a specific branch using the API's `head` filter.
+    /// Prefers open PRs over closed/merged ones.
+    pub async fn get_pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
         let page = self
             .octocrab
             .pulls(&self.owner, &self.repo)
             .list()
             .state(octocrab::params::State::All)
-            .per_page(100)
+            .head(format!("{}:{}", self.owner, branch))
+            .per_page(5)
             .send()
             .await?;
 
-        let mut prs = Vec::new();
-        for pr in page {
-            prs.push(PullRequest {
-                number: pr.number,
-                title: pr.title.unwrap_or_default(),
-                body: pr.body,
-                state: format!("{:?}", pr.state.unwrap()),
-                head_ref: pr.head.ref_field,
-                base_ref: pr.base.ref_field,
-                html_url: pr.html_url.unwrap().to_string(),
-                draft: pr.draft.unwrap_or(false),
-            });
+        let mut prs: Vec<PullRequest> = page
+            .into_iter()
+            .map(|pr| {
+                let state = if pr.merged_at.is_some() {
+                    "merged".to_string()
+                } else {
+                    format!("{:?}", pr.state.unwrap()).to_lowercase()
+                };
+                PullRequest {
+                    number: pr.number,
+                    title: pr.title.unwrap_or_default(),
+                    body: pr.body,
+                    state,
+                    head_ref: pr.head.ref_field,
+                    base_ref: pr.base.ref_field,
+                    html_url: pr.html_url.unwrap().to_string(),
+                    draft: pr.draft.unwrap_or(false),
+                }
+            })
+            .collect();
+
+        // Prefer open PR if one exists, otherwise return the most recent
+        if let Some(idx) = prs.iter().position(|pr| pr.state == "open") {
+            Ok(Some(prs.swap_remove(idx)))
+        } else {
+            Ok(prs.into_iter().next())
         }
-
-        Ok(prs)
-    }
-
-    #[allow(dead_code)]
-    pub async fn get_pull_request_by_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
-        let prs = self.get_pull_requests().await?;
-        Ok(prs.into_iter().find(|pr| pr.head_ref == branch))
     }
 
     pub async fn create_pull_request(
@@ -100,7 +140,7 @@ impl GitHubClient {
             number: pr.number,
             title: pr.title.unwrap_or_default(),
             body: pr.body,
-            state: format!("{:?}", pr.state.unwrap()),
+            state: format!("{:?}", pr.state.unwrap()).to_lowercase(),
             head_ref: pr.head.ref_field,
             base_ref: pr.base.ref_field,
             html_url: pr.html_url.unwrap().to_string(),
@@ -134,7 +174,7 @@ impl GitHubClient {
             number: pr.number,
             title: pr.title.unwrap_or_default(),
             body: pr.body,
-            state: format!("{:?}", pr.state.unwrap()),
+            state: format!("{:?}", pr.state.unwrap()).to_lowercase(),
             head_ref: pr.head.ref_field,
             base_ref: pr.base.ref_field,
             html_url: pr.html_url.unwrap().to_string(),
