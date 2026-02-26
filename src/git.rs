@@ -152,6 +152,38 @@ impl GitRepo {
         Ok(self.repo.find_reference(&remote_ref).is_ok())
     }
 
+    /// Check if local branch has diverged from its remote counterpart
+    /// (i.e., after a rebase, the two share history but are not fast-forward).
+    pub fn has_diverged_from_remote(&self, branch_name: &str) -> Result<bool> {
+        let local_ref = format!("refs/heads/{branch_name}");
+        let remote_ref = format!("refs/remotes/origin/{branch_name}");
+
+        let local_oid = match self.repo.find_reference(&local_ref) {
+            Ok(r) => r
+                .target()
+                .ok_or_else(|| anyhow!("No target for local ref"))?,
+            Err(_) => return Ok(false),
+        };
+        let remote_oid = match self.repo.find_reference(&remote_ref) {
+            Ok(r) => r
+                .target()
+                .ok_or_else(|| anyhow!("No target for remote ref"))?,
+            Err(_) => return Ok(false),
+        };
+
+        if local_oid == remote_oid {
+            return Ok(false);
+        }
+
+        // If local is a descendant of remote, it's ahead (not diverged)
+        if self.repo.graph_descendant_of(local_oid, remote_oid)? {
+            return Ok(false);
+        }
+
+        // Otherwise they've diverged
+        Ok(true)
+    }
+
     pub fn get_merge_base(&self, branch1: &str, branch2: &str) -> Result<Oid> {
         let commit1 = self.repo.revparse_single(branch1)?.id();
         let commit2 = self.repo.revparse_single(branch2)?.id();

@@ -134,7 +134,8 @@ impl GitHubClient {
             .body(body)
             .draft(draft)
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow!("Failed to create PR: {}", format_github_error(e)))?;
 
         Ok(PullRequest {
             number: pr.number,
@@ -168,7 +169,10 @@ impl GitHubClient {
             update = update.base(base);
         }
 
-        let pr = update.send().await?;
+        let pr = update
+            .send()
+            .await
+            .map_err(|e| anyhow!("Failed to update PR: {}", format_github_error(e)))?;
 
         Ok(PullRequest {
             number: pr.number,
@@ -226,6 +230,15 @@ impl GitHubClient {
             .update_comment(comment_id.into(), body)
             .await?;
         Ok(())
+    }
+}
+
+/// Extract a useful error message from octocrab errors.
+/// Octocrab's `Error::GitHub` Display just prints "GitHub" without the message.
+fn format_github_error(err: octocrab::Error) -> String {
+    match err {
+        octocrab::Error::GitHub { source, .. } => source.to_string(),
+        other => other.to_string(),
     }
 }
 
