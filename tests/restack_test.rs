@@ -79,26 +79,24 @@ fn test_rebase_onto_conflict_aborts() {
     // Should fail with conflict
     let result = repo.rebase_onto("B", "A");
     assert!(result.is_err(), "conflicting rebase should fail");
+    let err_msg = result.unwrap_err().to_string();
     assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("failed due to conflicts"),
+        err_msg.contains("conflicts"),
         "error message should mention conflicts"
     );
-
-    // No leftover rebase state
     assert!(
-        !p.join(".git/rebase-merge").exists(),
-        "rebase should have been aborted cleanly"
+        err_msg.contains("git rebase --continue"),
+        "error message should tell user how to continue"
     );
 
-    // B should be unchanged
-    let b_hash_after = git(p, &["rev-parse", "B"]);
-    assert_eq!(
-        b_hash_before, b_hash_after,
-        "B should be unchanged after failed rebase"
+    // Rebase state should be left in place for user to resolve
+    assert!(
+        p.join(".git/rebase-merge").exists(),
+        "rebase should be left in progress for conflict resolution"
     );
+
+    // Clean up so temp dir can be removed
+    git(p, &["rebase", "--abort"]);
 }
 
 #[test]

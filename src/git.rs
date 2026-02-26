@@ -189,14 +189,11 @@ impl GitRepo {
             return Ok(());
         }
 
-        // Rebase failed — abort to clean up
-        let _ = std::process::Command::new("git")
-            .args(["rebase", "--abort"])
-            .current_dir(workdir)
-            .output();
-
+        // Leave the rebase in progress so the user can resolve conflicts
         Err(anyhow!(
-            "Rebase of '{}' onto '{}' failed due to conflicts",
+            "Rebase of '{}' onto '{}' hit conflicts. Resolve them, then run:\n  \
+             git rebase --continue\n  \
+             stax restack --all",
             branch,
             onto
         ))

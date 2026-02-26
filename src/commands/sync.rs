@@ -140,7 +140,7 @@ async fn restack_branches(
     git: &GitRepo,
     _config: &Config,
     github: &GitHubClient,
-    original_branch: &str,
+    _original_branch: &str,
 ) -> Result<()> {
     let stack = Stack::analyze(git, Some(github)).await?;
     let main_branches = ["main", "master", "develop"];
@@ -173,13 +173,8 @@ async fn restack_branches(
         match git.rebase_onto(branch, parent) {
             Ok(()) => restacked.push(branch.as_str()),
             Err(e) => {
-                utils::print_error(&format!("Rebase failed for '{branch}': {e}"));
-                utils::print_warning(
-                    "Stopping restack. Fix conflicts manually, then run 'stax restack --all'",
-                );
-                // Restore original branch if possible
-                let _ = git.checkout_branch(original_branch);
-                return Ok(());
+                // Leave the user in the rebase flow to resolve conflicts
+                return Err(e);
             }
         }
     }

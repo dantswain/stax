@@ -59,11 +59,7 @@ pub async fn run(all: bool) -> Result<()> {
 
     for (branch, parent) in &branches_to_rebase {
         utils::print_info(&format!("Rebasing '{}' onto '{}'", branch, parent));
-        if let Err(e) = git.rebase_onto(branch, parent) {
-            // Restore original branch before returning error
-            let _ = git.checkout_branch(&current_branch);
-            return Err(e);
-        }
+        git.rebase_onto(branch, parent)?;
         restacked.push(branch.as_str());
     }
 
