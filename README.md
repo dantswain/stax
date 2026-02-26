@@ -6,6 +6,8 @@ A fast CLI tool for managing stacked pull requests on GitHub.
 
 Stax helps developers manage complex feature development workflows by organizing related branches into logical stacks. It provides commands to create branches, visualize stack structures, submit pull requests, and keep your stack synchronized with the main branch.
 
+Stax is inspired by [Graphite's CLI](https://graphite.com/docs/cli-overview) but does NOT aim to provide hosted review tooling.  Stax is only intended to help the workflow of managing stacked branches and pull requests.
+
 ## Features
 
 - 🌳 **Stack Visualization**: See the hierarchical structure of your branches
@@ -13,6 +15,84 @@ Stax helps developers manage complex feature development workflows by organizing
 - 📝 **PR Integration**: Create and manage GitHub pull requests for your stack
 - 🔄 **Sync & Restack**: Keep your branches up to date with their parents
 - ⚙️ **Configuration**: Flexible configuration management
+
+## Example Usage
+
+```bash
+# Start on main, create a feature branch
+$ stax create add-auth
+✓ Created and switched to branch 'add-auth'
+ℹ Parent branch: main
+
+# Do some work, commit, then submit a PR
+$ git add -A && git commit -m "Add authentication module"
+$ stax submit
+ℹ Pushing branch 'add-auth' to remote...
+✔ PR title · Add Auth
+? PR description (Ctrl+G for editor):
+ℹ Creating PR: 'Add Auth' (add-auth → main)
+✓ PR created: https://github.com/you/repo/pull/1
+
+# Stack another branch on top
+$ stax create add-login-page
+✓ Created and switched to branch 'add-login-page'
+ℹ Parent branch: add-auth
+
+$ git add -A && git commit -m "Add login page"
+$ stax submit
+✓ PR created: https://github.com/you/repo/pull/2
+
+# And one more
+$ stax create add-logout
+✓ Created and switched to branch 'add-logout'
+ℹ Parent branch: add-login-page
+
+$ git add -A && git commit -m "Add logout button"
+$ stax submit
+✓ PR created: https://github.com/you/repo/pull/3
+
+# See the full stack
+$ stax stack
+Stack Visualization
+
+main ○
+  ├─ add-auth ● PR #1
+    ├─ add-login-page ● PR #2
+      ├─ add-logout ← current ● PR #3
+
+# Navigate around
+$ stax bottom
+✓ Moved to bottom of stack: add-auth
+
+$ stax top
+✓ Moved to top of stack: add-logout
+
+$ stax down
+✓ Moved down to add-login-page
+
+# PR #1 gets merged on GitHub, sync everything
+$ stax sync
+ℹ Fetching from origin...
+✓ Fetched latest changes
+✓ Fast-forwarded 'main'
+ℹ Branches with merged/closed PRs:
+ℹ   add-auth (PR #1 merged)
+? Delete these branches locally and from remote? (y/N): y
+✓ Deleted 'add-auth'
+ℹ Rebasing 'add-login-page' onto 'main'
+✓ Restacked 'add-login-page'
+✓ Restacked 'add-logout'
+✓ Sync complete
+
+# Push updated branches and update PR metadata on GitHub
+$ stax submit --all
+ℹ Branch 'add-login-page' has diverged from remote, force-pushing...
+✓ Force-pushed 'add-login-page'
+ℹ Branch 'add-logout' has diverged from remote, force-pushing...
+✓ Force-pushed 'add-logout'
+✓ Updated PR: https://github.com/you/repo/pull/2
+✓ Updated PR: https://github.com/you/repo/pull/3
+```
 
 ## Installation
 
