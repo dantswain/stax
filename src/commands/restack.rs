@@ -3,8 +3,18 @@ use crate::stack::Stack;
 use crate::utils;
 use anyhow::{anyhow, Result};
 
-pub async fn run(all: bool) -> Result<()> {
+pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
+
+    if continue_rebase {
+        if git.is_rebase_in_progress() {
+            utils::print_info("Continuing rebase...");
+            git.rebase_continue()?;
+            utils::print_success("Rebase continued successfully");
+        }
+        // Re-run with --all to restack remaining branches
+        return Box::pin(run(true, false)).await;
+    }
 
     if !git.is_clean()? {
         return Err(anyhow!(

@@ -36,11 +36,15 @@ enum Commands {
         no_restack: bool,
         #[arg(short, long, help = "Skip confirmation prompts")]
         force: bool,
+        #[arg(long, help = "Continue after resolving rebase conflicts")]
+        r#continue: bool,
     },
     #[command(about = "Rebase branches on parents")]
     Restack {
         #[arg(long, help = "Restack all branches")]
         all: bool,
+        #[arg(long, help = "Continue after resolving rebase conflicts")]
+        r#continue: bool,
     },
     #[command(about = "Delete branch, update dependents")]
     Delete { branch: String },
@@ -79,8 +83,12 @@ async fn main() {
         Commands::Branch { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,
-        Commands::Sync { no_restack, force } => sync::run(no_restack, force).await,
-        Commands::Restack { all } => restack::run(all).await,
+        Commands::Sync {
+            no_restack,
+            force,
+            r#continue,
+        } => sync::run(no_restack, force, r#continue).await,
+        Commands::Restack { all, r#continue } => restack::run(all, r#continue).await,
         Commands::Delete { branch } => delete::run(&branch).await,
         Commands::Up => navigate::up().await,
         Commands::Down => navigate::down().await,

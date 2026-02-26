@@ -85,7 +85,7 @@ fn test_rebase_onto_conflict_aborts() {
         "error message should mention conflicts"
     );
     assert!(
-        err_msg.contains("git rebase --continue"),
+        err_msg.contains("stax sync --continue"),
         "error message should tell user how to continue"
     );
 

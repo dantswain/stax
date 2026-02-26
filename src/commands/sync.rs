@@ -1,9 +1,13 @@
 use crate::{config::Config, git::GitRepo, github::GitHubClient, stack::Stack, token_store, utils};
 use anyhow::{anyhow, Result};
 
-pub async fn run(no_restack: bool, force: bool) -> Result<()> {
+pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
+
+    if continue_rebase {
+        return continue_after_conflicts(&git, &config).await;
+    }
 
     // 1. Guard — abort if working tree is dirty
     if !git.is_clean()? {
@@ -183,6 +187,49 @@ async fn restack_branches(
         utils::print_success(&format!("Restacked '{branch}'"));
     }
 
+    Ok(())
+}
+
+/// Continue a sync after the user has resolved rebase conflicts.
+/// Finishes the in-progress rebase, then restacks any remaining branches.
+async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()> {
+    // 1. Finish the in-progress rebase
+    if git.is_rebase_in_progress() {
+        utils::print_info("Continuing rebase...");
+        git.rebase_continue()?;
+        utils::print_success("Rebase continued successfully");
+    }
+
+    // 2. Re-analyze and restack remaining branches
+    let stack = Stack::analyze(git, None).await?;
+    let main_branches = ["main", "master", "develop"];
+
+    let mut to_rebase: Vec<(String, String, usize)> = Vec::new();
+    for branch in stack.branches.values() {
+        if main_branches.contains(&branch.name.as_str()) {
+            continue;
+        }
+        if let Some(parent) = &branch.parent {
+            let depth = branch_depth(&stack, &branch.name);
+            to_rebase.push((branch.name.clone(), parent.clone(), depth));
+        }
+    }
+    to_rebase.sort_by_key(|(_, _, depth)| *depth);
+
+    let mut restacked = Vec::new();
+    for (branch, parent, _) in &to_rebase {
+        utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
+        match git.rebase_onto(branch, parent) {
+            Ok(()) => restacked.push(branch.as_str()),
+            Err(e) => return Err(e),
+        }
+    }
+
+    for branch in &restacked {
+        utils::print_success(&format!("Restacked '{branch}'"));
+    }
+
+    utils::print_success("Sync complete");
     Ok(())
 }
 

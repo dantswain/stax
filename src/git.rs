@@ -178,6 +178,14 @@ impl GitRepo {
     }
 
     pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
+        // Skip if branch is already based on onto (merge-base == onto's tip)
+        let onto_commit = self.get_commit_hash(&format!("refs/heads/{onto}"))?;
+        if let Ok(merge_base) = self.get_merge_base(branch, onto) {
+            if merge_base.to_string() == onto_commit {
+                return Ok(());
+            }
+        }
+
         let workdir = self.workdir()?;
 
         let output = std::process::Command::new("git")
@@ -191,12 +199,43 @@ impl GitRepo {
 
         // Leave the rebase in progress so the user can resolve conflicts
         Err(anyhow!(
-            "Rebase of '{}' onto '{}' hit conflicts. Resolve them, then run:\n  \
-             git rebase --continue\n  \
-             stax restack --all",
+            "Rebase of '{}' onto '{}' hit conflicts.\n\
+             Resolve conflicts, stage the files, then run:\n  \
+             stax sync --continue\n\
+             To abort instead:\n  \
+             git rebase --abort",
             branch,
             onto
         ))
+    }
+
+    pub fn rebase_continue(&self) -> Result<()> {
+        let workdir = self.workdir()?;
+
+        let output = std::process::Command::new("git")
+            .args(["rebase", "--continue"])
+            .current_dir(workdir)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+
+        if output.success() {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "git rebase --continue failed. Resolve remaining conflicts and run 'stax sync --continue' again."
+        ))
+    }
+
+    pub fn is_rebase_in_progress(&self) -> bool {
+        if let Ok(workdir) = self.workdir() {
+            let git_dir = workdir.join(".git");
+            git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
+        } else {
+            false
+        }
     }
 
     pub fn fetch(&self) -> Result<()> {
