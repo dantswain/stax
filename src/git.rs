@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use git2::{BranchType, Cred, Oid, PushOptions, RemoteCallbacks, Repository};
+use git2::{BranchType, Oid, Repository};
 use std::path::Path;
 
 pub struct GitRepo {
@@ -106,31 +106,25 @@ impl GitRepo {
     }
 
     pub fn push_branch(&self, branch_name: &str, force: bool) -> Result<()> {
-        let mut remote = self.repo.find_remote("origin")?;
-        let url = remote
-            .url()
-            .ok_or_else(|| anyhow!("Remote 'origin' not found"))?;
-
-        let mut callbacks = RemoteCallbacks::new();
-
-        if is_http_url(url) {
-            log::debug!("Setting up HTTPS callbacks for remote: {url}");
-            setup_https_callbacks(&mut callbacks)?;
-        } else {
-            log::debug!("Setting up SSH callbacks for remote: {url}");
-            setup_ssh_callbacks(&mut callbacks)?;
+        let workdir = self.workdir()?;
+        let mut args = vec!["push", "origin"];
+        if force {
+            args.push("--force-with-lease");
         }
+        // Push as branch_name:branch_name to be explicit
+        let refspec_owned = format!("{branch_name}:{branch_name}");
+        args.push(&refspec_owned);
 
-        let mut push_options = PushOptions::new();
-        push_options.remote_callbacks(callbacks);
+        log::debug!("Running: git {}", args.join(" "));
+        let output = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(workdir)
+            .output()?;
 
-        let refspec = if force {
-            format!("+refs/heads/{branch_name}:refs/heads/{branch_name}")
-        } else {
-            format!("refs/heads/{branch_name}:refs/heads/{branch_name}")
-        };
-        log::debug!("Pushing branch '{branch_name}' with refspec '{refspec}'");
-        remote.push(&[&refspec], Some(&mut push_options))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("git push failed: {}", stderr.trim()));
+        }
         Ok(())
     }
 
@@ -177,11 +171,14 @@ impl GitRepo {
         Ok(revwalk.count())
     }
 
-    pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
-        let workdir = self
-            .repo
+    fn workdir(&self) -> Result<&Path> {
+        self.repo
             .workdir()
-            .ok_or_else(|| anyhow!("Cannot determine working directory"))?;
+            .ok_or_else(|| anyhow!("Cannot determine working directory"))
+    }
+
+    pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
+        let workdir = self.workdir()?;
 
         let output = std::process::Command::new("git")
             .args(["rebase", onto, branch])
@@ -204,106 +201,108 @@ impl GitRepo {
             onto
         ))
     }
-}
 
-fn is_http_url(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
-}
+    pub fn fetch(&self) -> Result<()> {
+        let workdir = self.workdir()?;
+        let output = std::process::Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(workdir)
+            .output()?;
 
-fn setup_ssh_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
-    // Configure SSH callbacks if needed
-    callbacks.credentials(|url, username, allowed_types| {
-        let username = username.unwrap_or("git");
-
-        log::debug!("Setting up SSH credentials for URL: {url}");
-        log::debug!("Setting up SSH credentials for user: {username}");
-        log::debug!("Allowed credential types: {allowed_types:?}");
-
-        if !allowed_types.contains(git2::CredentialType::SSH_KEY) {
-            return Err(git2::Error::from_str("SSH key authentication not allowed"));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!("git fetch failed: {}", stderr.trim()));
         }
-
-        // NOTE in the future this should support ssh agent, but the below causes
-        //   a loop when I test it
-        /* if let Ok(cred) = git2::Cred::ssh_key_from_agent(username) {
-            log::debug!("Using SSH key from agent for user: {}", username);
-            return Ok(cred);
-        }
-        */
-
-        // fall back to ssh keys
-        try_ssh_keys(username)
-    });
-
-    callbacks.certificate_check(|_cert, _valid| Ok(git2::CertificateCheckStatus::CertificateOk));
-
-    Ok(())
-}
-
-fn try_ssh_keys(username: &str) -> Result<Cred, git2::Error> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| git2::Error::from_str("Cannot find home directory"))?;
-
-    let ssh_dir = std::path::Path::new(&home).join(".ssh");
-
-    log::debug!("Looking for SSH keys in: {}", ssh_dir.display());
-
-    for key_name in &["id_rsa", "id_ed25519", "id_ecdsa"] {
-        let private_key = ssh_dir.join(key_name);
-        let public_key = ssh_dir.join(format!("{key_name}.pub"));
-
-        log::debug!("Checking for private key: {}", private_key.display());
-
-        if private_key.exists() {
-            if let Ok(cred) = Cred::ssh_key(username, Some(&public_key), &private_key, None) {
-                return Ok(cred);
-            }
-        }
+        Ok(())
     }
 
-    Err(git2::Error::from_str("No valid SSH keys found"))
-}
+    /// Fast-forward a local branch to match its remote tracking branch.
+    /// Returns Ok(true) if the branch was updated, Ok(false) if already up to date.
+    pub fn fast_forward_branch(&self, branch_name: &str) -> Result<bool> {
+        let local_ref_name = format!("refs/heads/{branch_name}");
+        let remote_ref_name = format!("refs/remotes/origin/{branch_name}");
 
-fn setup_https_callbacks(callbacks: &mut RemoteCallbacks) -> Result<()> {
-    callbacks.credentials(|_url, _username_from_url, allowed_types| {
-        if !allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            return Err(git2::Error::from_str(
-                "Username/password authentication not allowed",
+        let local_ref = match self.repo.find_reference(&local_ref_name) {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        let remote_ref = match self.repo.find_reference(&remote_ref_name) {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+
+        let local_oid = local_ref
+            .target()
+            .ok_or_else(|| anyhow!("Local ref has no target"))?;
+        let remote_oid = remote_ref
+            .target()
+            .ok_or_else(|| anyhow!("Remote ref has no target"))?;
+
+        if local_oid == remote_oid {
+            return Ok(false);
+        }
+
+        // Remote is ahead of local → fast-forward is possible
+        if self.repo.graph_descendant_of(remote_oid, local_oid)? {
+            // fall through to do the fast-forward
+        } else if self.repo.graph_descendant_of(local_oid, remote_oid)? {
+            // Local is ahead of remote → nothing to fast-forward
+            return Ok(false);
+        } else {
+            // Truly diverged — both sides have unique commits
+            return Err(anyhow!(
+                "Cannot fast-forward '{}': local and remote have diverged",
+                branch_name
             ));
         }
 
-        // Try to get GitHub token from config or environment
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            return Cred::userpass_plaintext(&token, "x-oauth-basic");
-        }
+        // Move the local ref forward
+        self.repo.reference(
+            &local_ref_name,
+            remote_oid,
+            true,
+            &format!("stax: fast-forward {branch_name}"),
+        )?;
 
-        // Try to read from git config (requires git2 config reading)
-        if let Ok(token) = get_github_token_from_config() {
-            return git2::Cred::userpass_plaintext(&token, "x-oauth-basic");
-        }
-
-        Err(git2::Error::from_str("No HTTPS credentials found"))
-    });
-
-    Ok(())
-}
-
-fn get_github_token_from_config() -> Result<String, git2::Error> {
-    // Try to read from git config
-    let config = git2::Config::open_default()
-        .map_err(|_| git2::Error::from_str("Cannot open git config"))?;
-
-    // Check common config keys where users might store tokens
-    for key in &["github.token", "credential.github.com.username"] {
-        if let Ok(token) = config.get_string(key) {
-            if !token.is_empty() {
-                return Ok(token);
+        // If this branch is currently checked out, update the working directory too
+        if let Ok(head) = self.repo.head() {
+            if head.name() == Some(&local_ref_name) {
+                let obj = self.repo.find_object(remote_oid, None)?;
+                self.repo
+                    .checkout_tree(&obj, Some(git2::build::CheckoutBuilder::new().force()))?;
             }
         }
+
+        Ok(true)
     }
 
-    Err(git2::Error::from_str("No token found in git config"))
+    /// Delete a local branch and optionally its remote counterpart.
+    pub fn delete_branch(&self, branch_name: &str, delete_remote: bool) -> Result<()> {
+        // Delete local branch
+        let mut branch = self.repo.find_branch(branch_name, BranchType::Local)?;
+        branch.delete()?;
+
+        // Delete remote branch if requested and it exists
+        if delete_remote && self.has_remote_branch(branch_name)? {
+            let workdir = self.workdir()?;
+            let refspec = format!(":{branch_name}");
+            let output = std::process::Command::new("git")
+                .args(["push", "origin", &refspec])
+                .current_dir(workdir)
+                .output()?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!(
+                    "Failed to delete remote branch '{}': {}",
+                    branch_name,
+                    stderr.trim()
+                ));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

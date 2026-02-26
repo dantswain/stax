@@ -1,6 +1,14 @@
-use crate::{config::Config, git::GitRepo, github::GitHubClient, stack::Stack, token_store, utils};
+use crate::{
+    config::Config,
+    git::GitRepo,
+    github::{GitHubClient, PullRequest},
+    stack::{Stack, StackBranch},
+    token_store, utils,
+};
 use anyhow::{anyhow, Result};
-use dialoguer::{theme::ColorfulTheme, Confirm, Input};
+use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Input, Select};
+
+const STACK_COMMENT_MARKER: &str = "<!-- stax-stack-comment -->";
 
 pub async fn run(all: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
@@ -67,10 +75,21 @@ async fn submit_current_branch(
         if update {
             update_existing_pr(github, existing_pr.number, config).await?;
         }
+
+        // Update stack comments on all PRs
+        let fresh_stack = Stack::analyze(git, Some(github)).await?;
+        update_stack_comments(github, &fresh_stack).await?;
+
         return Ok(());
     }
 
-    create_new_pr(git, github, current_branch, stack, config).await
+    create_new_pr(git, github, current_branch, stack, config).await?;
+
+    // Re-analyze to pick up newly created PR, then update stack comments
+    let fresh_stack = Stack::analyze(git, Some(github)).await?;
+    update_stack_comments(github, &fresh_stack).await?;
+
+    Ok(())
 }
 
 async fn submit_stack(
@@ -106,6 +125,11 @@ async fn submit_stack(
     }
 
     utils::print_success("Stack submission completed!");
+
+    // Re-analyze to pick up newly created PRs, then update stack comments
+    let fresh_stack = Stack::analyze(git, Some(github)).await?;
+    update_stack_comments(github, &fresh_stack).await?;
+
     Ok(())
 }
 
@@ -177,15 +201,27 @@ async fn create_new_pr(
         return Err(anyhow!("PR title cannot be empty"));
     }
 
-    // Get PR body (use template if available)
-    let default_body = config.pr_template.as_deref().unwrap_or(
-        "## Summary\n\n<!-- Describe your changes -->\n\n## Testing\n\n<!-- How did you test this? -->"
-    );
-
-    let body: String = Input::with_theme(&ColorfulTheme::default())
+    // Get PR body
+    let default_body = config.pr_template.as_deref().unwrap_or("");
+    let body_options = &["Empty", "Write inline", "Open editor"];
+    let body_choice = Select::with_theme(&ColorfulTheme::default())
         .with_prompt("PR description")
-        .default(default_body.to_string())
-        .interact_text()?;
+        .items(body_options)
+        .default(0)
+        .interact()?;
+
+    let body: String = match body_choice {
+        0 => default_body.to_string(),
+        1 => Input::with_theme(&ColorfulTheme::default())
+            .with_prompt("Description")
+            .default(default_body.to_string())
+            .interact_text()?,
+        2 => Editor::new()
+            .extension(".md")
+            .edit(default_body)?
+            .unwrap_or_else(|| default_body.to_string()),
+        _ => unreachable!(),
+    };
 
     // Create the PR
     utils::print_info(&format!(
@@ -203,6 +239,506 @@ async fn create_new_pr(
     }
 
     Ok(())
+}
+
+fn render_stack_comment(stack: &Stack, current_pr_number: u64) -> String {
+    let current_branch = &stack.current_branch;
+
+    // Walk up to find the root of the stack (the base branch)
+    let mut root = current_branch.as_str();
+    while let Some(branch) = stack.branches.get(root) {
+        match &branch.parent {
+            Some(parent) => root = parent,
+            None => break,
+        }
+    }
+    let base_branch = root;
+
+    // Collect ancestor chain: [current_branch, parent, ..., root]
+    let mut ancestors = Vec::new();
+    let mut cur = current_branch.as_str();
+    while let Some(branch) = stack.branches.get(cur) {
+        ancestors.push(branch);
+        match &branch.parent {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+
+    // Render descendants of current_branch as a tree (children before parent = reversed)
+    let mut body_lines = Vec::new();
+    if let Some(branch) = stack.branches.get(current_branch.as_str()) {
+        render_subtree(stack, branch, 0, current_pr_number, &mut body_lines);
+    }
+
+    // Render ancestor chain (parent → ... → root's first child), skipping current_branch
+    // and skipping the base branch itself (it goes in the footer)
+    for ancestor in &ancestors {
+        if ancestor.name == current_branch.as_str() {
+            continue;
+        }
+        if ancestor.name == base_branch && ancestor.pull_request.is_none() {
+            continue;
+        }
+        if let Some(pr) = &ancestor.pull_request {
+            let is_current = pr.number == current_pr_number;
+            body_lines.push(format_stack_line(&ancestor.name, pr, 0, is_current));
+        }
+    }
+
+    let mut result = vec![STACK_COMMENT_MARKER.to_string(), "### Stack".to_string()];
+    result.extend(body_lines);
+    result.push(String::new());
+    result.push(format!("\u{2193} merges to `{base_branch}`"));
+
+    result.join("\n")
+}
+
+/// Recursively render a branch and its descendants. Children are rendered before
+/// their parent so the output is in reverse order (leaves at top).
+/// When a branch has multiple children, they are indented one level deeper.
+fn render_subtree(
+    stack: &Stack,
+    branch: &StackBranch,
+    depth: usize,
+    current_pr_number: u64,
+    lines: &mut Vec<String>,
+) {
+    let children: Vec<_> = branch
+        .children
+        .iter()
+        .filter_map(|name| stack.branches.get(name))
+        .collect();
+
+    let child_depth = if children.len() > 1 { depth + 1 } else { depth };
+
+    for child in &children {
+        render_subtree(stack, child, child_depth, current_pr_number, lines);
+    }
+
+    if let Some(pr) = &branch.pull_request {
+        let is_current = pr.number == current_pr_number;
+        lines.push(format_stack_line(&branch.name, pr, depth, is_current));
+    }
+}
+
+fn format_stack_line(
+    branch_name: &str,
+    pr: &PullRequest,
+    depth: usize,
+    is_current: bool,
+) -> String {
+    let indent = "&nbsp;&nbsp;".repeat(depth);
+    if is_current {
+        format!(
+            "- {indent}**`{branch_name}` [#{}]({}) \u{2190} this PR**",
+            pr.number, pr.html_url
+        )
+    } else {
+        format!(
+            "- {indent}`{branch_name}` [#{}]({})",
+            pr.number, pr.html_url
+        )
+    }
+}
+
+async fn update_stack_comments(github: &GitHubClient, stack: &Stack) -> Result<()> {
+    let current_branch = &stack.current_branch;
+    let stack_branches = stack.get_stack_for_branch(current_branch);
+
+    let branches_with_prs: Vec<_> = stack_branches
+        .iter()
+        .filter(|b| b.pull_request.is_some())
+        .collect();
+
+    if branches_with_prs.is_empty() {
+        return Ok(());
+    }
+
+    utils::print_info("Updating stack comments on PRs...");
+
+    for branch in &branches_with_prs {
+        let pr = branch.pull_request.as_ref().unwrap();
+        let comment_body = render_stack_comment(stack, pr.number);
+
+        let comments = github.list_pr_comments(pr.number).await?;
+        let existing = comments
+            .iter()
+            .find(|(_, body)| body.contains(STACK_COMMENT_MARKER));
+
+        match existing {
+            Some((comment_id, _)) => {
+                github.update_pr_comment(*comment_id, &comment_body).await?;
+            }
+            None => {
+                github.create_pr_comment(pr.number, &comment_body).await?;
+            }
+        }
+    }
+
+    utils::print_success("Stack comments updated on all PRs");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::PullRequest;
+    use crate::stack::{Stack, StackBranch};
+    use std::collections::HashMap;
+
+    fn make_pr(number: u64, branch: &str) -> PullRequest {
+        PullRequest {
+            number,
+            title: format!("PR for {branch}"),
+            body: None,
+            state: "open".to_string(),
+            head_ref: branch.to_string(),
+            base_ref: "main".to_string(),
+            html_url: format!("https://github.com/owner/repo/pull/{number}"),
+            draft: false,
+        }
+    }
+
+    fn make_branch(
+        name: &str,
+        parent: Option<&str>,
+        children: Vec<&str>,
+        pr: Option<PullRequest>,
+    ) -> StackBranch {
+        StackBranch {
+            name: name.to_string(),
+            parent: parent.map(|s| s.to_string()),
+            children: children.into_iter().map(|s| s.to_string()).collect(),
+            commit_hash: "abc123".to_string(),
+            pull_request: pr,
+            is_current: false,
+        }
+    }
+
+    /// Helper: extract the list-item lines (lines starting with "- ")
+    fn list_lines(comment: &str) -> Vec<&str> {
+        comment.lines().filter(|l| l.starts_with("- ")).collect()
+    }
+
+    /// main -> A (#1) -> B (#2) -> C (#3), current_branch = B
+    fn make_linear_stack() -> Stack {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C"], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+
+        Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "B".to_string(),
+        }
+    }
+
+    // ---- basic structure tests ----
+
+    #[test]
+    fn test_contains_marker_and_header() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        assert!(comment.starts_with(STACK_COMMENT_MARKER));
+        assert!(comment.contains("### Stack"));
+    }
+
+    #[test]
+    fn test_merges_to_footer() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        assert!(comment.contains("\u{2193} merges to `main`"));
+    }
+
+    #[test]
+    fn test_base_branch_not_in_list() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        // main should only appear in the footer, not as a list item
+        let items = list_lines(&comment);
+        assert!(!items.iter().any(|l| l.contains("`main`")));
+    }
+
+    // ---- linear stack ordering (reversed: leaf at top, root at bottom) ----
+
+    #[test]
+    fn test_linear_reversed_order() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        let items = list_lines(&comment);
+
+        // Should be C (leaf) at top, then B, then A (closest to main) at bottom
+        assert_eq!(items.len(), 3);
+        assert!(items[0].contains("`C`"));
+        assert!(items[1].contains("`B`"));
+        assert!(items[2].contains("`A`"));
+    }
+
+    // ---- current PR marker ----
+
+    #[test]
+    fn test_current_pr_is_bolded() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        assert!(comment.contains("**`B` [#2]"));
+        assert!(comment.contains("\u{2190} this PR**"));
+    }
+
+    #[test]
+    fn test_other_prs_not_bolded() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        // A and C should not be bolded
+        assert!(comment.contains("- `C` [#3]"));
+        assert!(comment.contains("- `A` [#1]"));
+    }
+
+    #[test]
+    fn test_different_current_per_pr() {
+        let stack = make_linear_stack();
+
+        let comment_a = render_stack_comment(&stack, 1);
+        assert!(comment_a.contains("**`A` [#1]"));
+        assert!(comment_a.contains("- `B` [#2]"));
+
+        let comment_c = render_stack_comment(&stack, 3);
+        assert!(comment_c.contains("**`C` [#3]"));
+        assert!(comment_c.contains("- `A` [#1]"));
+    }
+
+    // ---- single PR ----
+
+    #[test]
+    fn test_single_pr() {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["feat"], None),
+        );
+        branches.insert(
+            "feat".to_string(),
+            make_branch("feat", Some("main"), vec![], Some(make_pr(10, "feat"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "feat".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 10);
+        let items = list_lines(&comment);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].contains("**`feat` [#10]"));
+        assert!(comment.contains("\u{2193} merges to `main`"));
+    }
+
+    // ---- branches without PRs are skipped ----
+
+    #[test]
+    fn test_skips_branches_without_prs() {
+        // main -> A(PR) -> B(no PR) -> C(PR), current_branch = C
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C"], None),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "C".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 3);
+        let items = list_lines(&comment);
+        assert_eq!(items.len(), 2);
+        assert!(items[0].contains("`C`"));
+        assert!(items[1].contains("`A`"));
+        assert!(!comment.contains("`B`"));
+    }
+
+    // ---- branching stacks ----
+
+    #[test]
+    fn test_branching_children_are_indented() {
+        // main -> A(PR) -> B(PR), A -> C(PR), current_branch = A
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B", "C"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec![], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("A"), vec![], Some(make_pr(3, "C"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "A".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 1);
+        let items = list_lines(&comment);
+
+        // B and C should be indented (depth 1), A should not (depth 0)
+        assert_eq!(items.len(), 3);
+        assert!(items[0].contains("&nbsp;&nbsp;`B`"));
+        assert!(items[1].contains("&nbsp;&nbsp;`C`"));
+        assert!(items[2].starts_with("- **`A`"));
+    }
+
+    #[test]
+    fn test_linear_children_not_indented() {
+        // main -> A(PR) -> B(PR) -> C(PR), current_branch = A
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C"], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "A".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 1);
+        let items = list_lines(&comment);
+
+        // No branching, so no indentation on any line
+        for item in &items {
+            assert!(!item.contains("&nbsp;"), "unexpected indent: {item}");
+        }
+    }
+
+    #[test]
+    fn test_deep_branching() {
+        // main -> A(PR) -> B(PR) -> C(PR), B -> D(PR), current_branch = A
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C", "D"], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+        branches.insert(
+            "D".to_string(),
+            make_branch("D", Some("B"), vec![], Some(make_pr(4, "D"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "A".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 2);
+        let items = list_lines(&comment);
+
+        // C and D are siblings under B → indented at depth 1
+        // B and A are linear → depth 0
+        assert_eq!(items.len(), 4);
+        assert!(items[0].contains("&nbsp;&nbsp;`C`"));
+        assert!(items[1].contains("&nbsp;&nbsp;`D`"));
+        assert!(items[2].starts_with("- **`B`")); // no indent, current PR
+        assert!(items[3].starts_with("- `A`")); // no indent
+    }
+
+    #[test]
+    fn test_branching_through_no_pr_branch() {
+        // main -> A(PR) -> B(no PR) -> C(PR), B -> D(PR), current_branch = A
+        // B has no PR but has 2 children — children should still be indented
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C", "D"], None),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+        branches.insert(
+            "D".to_string(),
+            make_branch("D", Some("B"), vec![], Some(make_pr(4, "D"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "A".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 1);
+        let items = list_lines(&comment);
+
+        // B is invisible (no PR) but C and D are still indented because B has 2 children
+        assert_eq!(items.len(), 3);
+        assert!(items[0].contains("&nbsp;&nbsp;`C`"));
+        assert!(items[1].contains("&nbsp;&nbsp;`D`"));
+        assert!(items[2].starts_with("- **`A`"));
+        assert!(!comment.contains("`B`"));
+    }
 }
 
 async fn update_existing_pr(github: &GitHubClient, pr_number: u64, _config: &Config) -> Result<()> {

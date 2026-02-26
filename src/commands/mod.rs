@@ -2,6 +2,7 @@ pub mod auth;
 pub mod branch;
 pub mod config;
 pub mod delete;
+pub mod navigate;
 pub mod restack;
 pub mod stack;
 pub mod status;

@@ -23,21 +23,74 @@ pub struct Stack {
 
 impl Stack {
     pub async fn analyze(git: &GitRepo, github: Option<&GitHubClient>) -> Result<Self> {
-        let branches = git.get_branches()?;
+        let all_branches = git.get_branches()?;
         let current_branch = git.current_branch()?;
 
-        let mut stack_branches = HashMap::new();
-        let mut prs = HashMap::new();
+        let main_branches = ["main", "master", "develop"];
 
-        if let Some(github_client) = github {
-            let all_prs = github_client.get_pull_requests().await?;
-            for pr in all_prs {
+        // Filter out branches that are fully merged into trunk
+        let trunk = main_branches
+            .iter()
+            .find(|name| all_branches.contains(&name.to_string()))
+            .map(|s| s.to_string());
+        let branches: Vec<String> = all_branches
+            .into_iter()
+            .filter(|b| {
+                main_branches.contains(&b.as_str())
+                    || trunk.as_ref().is_none_or(|t| !is_merged_into(git, b, t))
+            })
+            .collect();
+
+        // Fetch first page of open PRs (single request, covers most small/medium repos)
+        // Run concurrently with local git work
+        let bulk_handle = if let Some(gh) = github {
+            let gh = gh.clone();
+            Some(tokio::spawn(
+                async move { gh.get_open_pull_requests().await },
+            ))
+        } else {
+            None
+        };
+
+        // Do expensive local git work while the bulk fetch is in flight
+        let (relationships, commits) = Self::detect_relationships(git, &branches)?;
+
+        // Collect bulk PR results
+        let mut prs: HashMap<String, PullRequest> = HashMap::new();
+        if let Some(handle) = bulk_handle {
+            for pr in handle.await?? {
                 prs.insert(pr.head_ref.clone(), pr);
             }
         }
 
+        // Find branches still missing PRs and fetch individually in parallel
+        if let Some(gh) = github {
+            let missing: Vec<_> = branches
+                .iter()
+                .filter(|b| !main_branches.contains(&b.as_str()) && !prs.contains_key(*b))
+                .cloned()
+                .collect();
+
+            if !missing.is_empty() {
+                let handles: Vec<_> = missing
+                    .into_iter()
+                    .map(|branch| {
+                        let gh = gh.clone();
+                        tokio::spawn(async move { gh.get_pr_for_branch(&branch).await })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    if let Ok(Some(pr)) = handle.await? {
+                        prs.insert(pr.head_ref.clone(), pr);
+                    }
+                }
+            }
+        }
+
+        let mut stack_branches = HashMap::new();
         for branch_name in &branches {
-            let commit_hash = git.get_commit_hash(&format!("refs/heads/{branch_name}"))?;
+            let commit_hash = commits.get(branch_name).cloned().unwrap_or_default();
             let pull_request = prs.get(branch_name).cloned();
             let is_current = branch_name == &current_branch;
 
@@ -53,8 +106,6 @@ impl Stack {
                 },
             );
         }
-
-        let relationships = Self::detect_relationships(git, &branches)?;
 
         for (child, parent) in relationships {
             if let Some(child_branch) = stack_branches.get_mut(&child) {
@@ -78,16 +129,49 @@ impl Stack {
         })
     }
 
-    fn detect_relationships(git: &GitRepo, branches: &[String]) -> Result<Vec<(String, String)>> {
+    #[allow(clippy::type_complexity)]
+    fn detect_relationships(
+        git: &GitRepo,
+        branches: &[String],
+    ) -> Result<(Vec<(String, String)>, HashMap<String, String>)> {
         let mut relationships = Vec::new();
         let main_branches = ["main", "master", "develop"];
 
+        // Pre-compute all commit hashes once (avoids redundant calls in inner loop)
+        let commits: HashMap<String, String> = branches
+            .iter()
+            .map(|b| {
+                let hash = git.get_commit_hash(&format!("refs/heads/{b}"))?;
+                Ok((b.clone(), hash))
+            })
+            .collect::<Result<_>>()?;
+
+        // Find the trunk branch for fallback and merged-branch detection
+        let trunk = main_branches
+            .iter()
+            .find(|name| branches.contains(&name.to_string()))
+            .map(|s| s.to_string());
+
+        // Pre-compute merged status once per branch
+        let merged: HashSet<String> = if let Some(ref trunk_name) = trunk {
+            branches
+                .iter()
+                .filter(|b| {
+                    !main_branches.contains(&b.as_str())
+                        && is_merged_into_cached(&commits, git, b, trunk_name)
+                })
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         for branch in branches {
-            if main_branches.contains(&branch.as_str()) {
+            if main_branches.contains(&branch.as_str()) || merged.contains(branch) {
                 continue;
             }
 
-            let current_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
+            let current_commit = &commits[branch];
             let mut best_parent = None;
             let mut min_distance = usize::MAX;
 
@@ -96,16 +180,21 @@ impl Stack {
                     continue;
                 }
 
-                let parent_commit =
-                    git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
+                let parent_commit = &commits[potential_parent];
 
-                // Skip if both branches point to the same commit (they're siblings, not parent-child)
                 if current_commit == parent_commit {
                     continue;
                 }
 
+                // Skip merged non-trunk branches
+                if !main_branches.contains(&potential_parent.as_str())
+                    && merged.contains(potential_parent)
+                {
+                    continue;
+                }
+
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
-                    if merge_base.to_string() == parent_commit {
+                    if merge_base.to_string() == *parent_commit {
                         let distance = git.count_commits_between(
                             &format!("refs/heads/{potential_parent}"),
                             &format!("refs/heads/{branch}"),
@@ -118,12 +207,19 @@ impl Stack {
                 }
             }
 
+            // Fall back to trunk if no parent detected
+            if best_parent.is_none() {
+                if let Some(ref trunk_name) = trunk {
+                    best_parent = Some(trunk_name.clone());
+                }
+            }
+
             if let Some(parent) = best_parent {
                 relationships.push((branch.clone(), parent));
             }
         }
 
-        Ok(relationships)
+        Ok((relationships, commits))
     }
 
     pub fn get_stack_for_branch(&self, branch_name: &str) -> Vec<&StackBranch> {
@@ -168,6 +264,34 @@ impl Stack {
                 .as_ref()
                 .is_none_or(|pr| pr.state == "open" || pr.state == "draft")
         })
+    }
+}
+
+/// Check if a branch is fully merged into trunk
+/// (its tip is an ancestor of trunk's tip).
+fn is_merged_into(git: &GitRepo, branch: &str, trunk: &str) -> bool {
+    let branch_hash = git.get_commit_hash(&format!("refs/heads/{branch}")).ok();
+    let merge_base = git.get_merge_base(branch, trunk).ok();
+    match (branch_hash, merge_base) {
+        (Some(bh), Some(mb)) => bh == mb.to_string(),
+        _ => false,
+    }
+}
+
+/// Same check but uses pre-computed commit hashes to avoid redundant lookups.
+fn is_merged_into_cached(
+    commits: &HashMap<String, String>,
+    git: &GitRepo,
+    branch: &str,
+    trunk: &str,
+) -> bool {
+    let Some(branch_hash) = commits.get(branch) else {
+        return false;
+    };
+    let merge_base = git.get_merge_base(branch, trunk).ok();
+    match merge_base {
+        Some(mb) => *branch_hash == mb.to_string(),
+        None => false,
     }
 }
 

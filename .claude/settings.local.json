@@ -17,7 +17,13 @@
       "Bash(echo exit: $?:*)",
       "Bash(which stax 2>&1 && stax stack 2>&1)",
       "Bash(cargo install:*)",
-      "Bash(stax stack:*)"
+      "Bash(stax stack:*)",
+      "WebSearch",
+      "WebFetch(domain:graphite.com)",
+      "Bash(git:*)",
+      "Bash(time /Users/dswain/src/stax/target/release/stax down:*)",
+      "Bash(time /Users/dswain/src/stax/target/release/stax up:*)",
+      "Bash(time /Users/dswain/src/stax/target/release/stax stack:*)"
     ],
     "deny": []
   }

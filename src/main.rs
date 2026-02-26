@@ -32,8 +32,10 @@ enum Commands {
     },
     #[command(about = "Sync with remote")]
     Sync {
-        #[arg(long, help = "Sync all branches in stack")]
-        all: bool,
+        #[arg(long, help = "Skip restacking branches")]
+        no_restack: bool,
+        #[arg(short, long, help = "Skip confirmation prompts")]
+        force: bool,
     },
     #[command(about = "Rebase branches on parents")]
     Restack {
@@ -42,6 +44,14 @@ enum Commands {
     },
     #[command(about = "Delete branch, update dependents")]
     Delete { branch: String },
+    #[command(about = "Move up the stack (away from main)")]
+    Up,
+    #[command(about = "Move down the stack (toward main)")]
+    Down,
+    #[command(about = "Move to the top of the stack")]
+    Top,
+    #[command(about = "Move to the bottom of the stack")]
+    Bottom,
     #[command(about = "Show current status")]
     Status,
     #[command(about = "Manage configuration")]
@@ -69,9 +79,13 @@ async fn main() {
         Commands::Branch { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,
-        Commands::Sync { all } => sync::run(all).await,
+        Commands::Sync { no_restack, force } => sync::run(no_restack, force).await,
         Commands::Restack { all } => restack::run(all).await,
         Commands::Delete { branch } => delete::run(&branch).await,
+        Commands::Up => navigate::up().await,
+        Commands::Down => navigate::down().await,
+        Commands::Top => navigate::top().await,
+        Commands::Bottom => navigate::bottom().await,
         Commands::Status => status::run().await,
         Commands::Config(config_cmd) => match config_cmd {
             ConfigCommands::Set { key, value } => commands::config::set(&key, &value).await,
