@@ -14,7 +14,9 @@
       "Bash(grep:*)",
       "Bash(git commit:*)",
       "Bash(cargo test:*)",
-      "Bash(echo exit: $?:*)"
+      "Bash(echo exit: $?:*)",
+      "WebSearch",
+      "WebFetch(domain:graphite.com)"
     ],
     "deny": []
   }
