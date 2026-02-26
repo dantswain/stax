@@ -2,10 +2,27 @@ use crate::git::GitRepo;
 use crate::stack::Stack;
 use crate::utils;
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 
-pub async fn run(all: bool) -> Result<()> {
+pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
 
+    if continue_rebase {
+        if git.is_rebase_in_progress() {
+            utils::print_info("Continuing rebase...");
+            git.rebase_continue()?;
+            utils::print_success("Rebase continued successfully");
+        }
+        // Re-run with --all to restack remaining branches
+        return Box::pin(run(true, false)).await;
+    }
+
+    if git.is_rebase_in_progress() {
+        return Err(anyhow!(
+            "A rebase is currently in progress.\n\
+             Resolve conflicts and run 'stax restack --continue', or 'git rebase --abort' to cancel."
+        ));
+    }
     if !git.is_clean()? {
         return Err(anyhow!(
             "Working directory has uncommitted changes. Please commit or stash them first."
@@ -55,15 +72,24 @@ pub async fn run(all: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Snapshot branch tips BEFORE any rebasing for --onto
+    let mut old_tips: HashMap<String, String> = HashMap::new();
+    for (branch, parent) in &branches_to_rebase {
+        for name in [branch, parent] {
+            if !old_tips.contains_key(name) {
+                if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
+                    old_tips.insert(name.clone(), hash);
+                }
+            }
+        }
+    }
+
     let mut restacked = Vec::new();
 
     for (branch, parent) in &branches_to_rebase {
         utils::print_info(&format!("Rebasing '{}' onto '{}'", branch, parent));
-        if let Err(e) = git.rebase_onto(branch, parent) {
-            // Restore original branch before returning error
-            let _ = git.checkout_branch(&current_branch);
-            return Err(e);
-        }
+        let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
+        git.rebase_onto_with_base(branch, parent, old_parent_tip)?;
         restacked.push(branch.as_str());
     }
 

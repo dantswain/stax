@@ -1,11 +1,21 @@
 use crate::{config::Config, git::GitRepo, github::GitHubClient, stack::Stack, token_store, utils};
 use anyhow::{anyhow, Result};
 
-pub async fn run(no_restack: bool, force: bool) -> Result<()> {
+pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
 
-    // 1. Guard — abort if working tree is dirty
+    if continue_rebase {
+        return continue_after_conflicts(&git, &config).await;
+    }
+
+    // 1. Guard — abort if rebase in progress or working tree is dirty
+    if git.is_rebase_in_progress() {
+        return Err(anyhow!(
+            "A rebase is currently in progress.\n\
+             Resolve conflicts and run 'stax sync --continue', or 'git rebase --abort' to cancel."
+        ));
+    }
     if !git.is_clean()? {
         return Err(anyhow!(
             "Working directory has uncommitted changes. Please commit or stash them first."
@@ -140,9 +150,14 @@ async fn restack_branches(
     git: &GitRepo,
     _config: &Config,
     github: &GitHubClient,
-    original_branch: &str,
+    _original_branch: &str,
 ) -> Result<()> {
-    let stack = Stack::analyze(git, Some(github)).await?;
+    restack_all(git, Some(github)).await
+}
+
+/// Shared restack logic used by both normal sync and --continue.
+async fn restack_all(git: &GitRepo, github: Option<&GitHubClient>) -> Result<()> {
+    let stack = Stack::analyze(git, github).await?;
     let main_branches = ["main", "master", "develop"];
 
     // Collect branches with their parents and depth for topological ordering.
@@ -166,21 +181,29 @@ async fn restack_branches(
         return Ok(());
     }
 
+    // Snapshot ALL branch tips BEFORE any rebasing.
+    // When rebasing B onto A, we use A's OLD tip as the --onto base so that
+    // only B's own commits get replayed (not A's original commits).
+    let mut old_tips: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (branch, parent, _) in &to_rebase {
+        for name in [branch, parent] {
+            if !old_tips.contains_key(name) {
+                if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
+                    old_tips.insert(name.clone(), hash);
+                }
+            }
+        }
+    }
+
     let mut restacked = Vec::new();
 
     for (branch, parent, _) in &to_rebase {
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
-        match git.rebase_onto(branch, parent) {
+        // Use the parent's pre-rebase tip so --onto only replays branch's own commits
+        let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
+        match git.rebase_onto_with_base(branch, parent, old_parent_tip) {
             Ok(()) => restacked.push(branch.as_str()),
-            Err(e) => {
-                utils::print_error(&format!("Rebase failed for '{branch}': {e}"));
-                utils::print_warning(
-                    "Stopping restack. Fix conflicts manually, then run 'stax restack --all'",
-                );
-                // Restore original branch if possible
-                let _ = git.checkout_branch(original_branch);
-                return Ok(());
-            }
+            Err(e) => return Err(e),
         }
     }
 
@@ -188,6 +211,21 @@ async fn restack_branches(
         utils::print_success(&format!("Restacked '{branch}'"));
     }
 
+    Ok(())
+}
+
+/// Continue a sync after the user has resolved rebase conflicts.
+/// Finishes the in-progress rebase, then restacks any remaining branches.
+async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()> {
+    if git.is_rebase_in_progress() {
+        utils::print_info("Continuing rebase...");
+        git.rebase_continue()?;
+        utils::print_success("Rebase continued successfully");
+    }
+
+    // Re-analyze and restack remaining branches
+    restack_all(git, None).await?;
+    utils::print_success("Sync complete");
     Ok(())
 }
 

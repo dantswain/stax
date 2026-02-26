@@ -23,7 +23,10 @@
       "Bash(git:*)",
       "Bash(time /Users/dswain/src/stax/target/release/stax down:*)",
       "Bash(time /Users/dswain/src/stax/target/release/stax up:*)",
-      "Bash(time /Users/dswain/src/stax/target/release/stax stack:*)"
+      "Bash(time /Users/dswain/src/stax/target/release/stax stack:*)",
+      "WebFetch(domain:docs.rs)",
+      "Bash(echo EDITOR=$EDITOR VISUAL=$VISUAL:*)",
+      "Bash(cargo metadata:*)"
     ],
     "deny": []
   }

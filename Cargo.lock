@@ -2072,6 +2072,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "console",
  "dialoguer",
  "dirs",
  "env_logger",

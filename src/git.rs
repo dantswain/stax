@@ -177,29 +177,87 @@ impl GitRepo {
             .ok_or_else(|| anyhow!("Cannot determine working directory"))
     }
 
+    /// Rebase `branch` onto `onto`.
+    /// If `old_onto_commit` is provided, uses `--onto` to only replay commits
+    /// after the old parent tip (avoids re-applying parent's commits).
     pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
+        self.rebase_onto_with_base(branch, onto, None)
+    }
+
+    pub fn rebase_onto_with_base(
+        &self,
+        branch: &str,
+        onto: &str,
+        old_onto_commit: Option<&str>,
+    ) -> Result<()> {
+        // Skip if branch is already based on onto
+        let onto_commit = self.get_commit_hash(&format!("refs/heads/{onto}"))?;
+        if let Ok(merge_base) = self.get_merge_base(branch, onto) {
+            if merge_base.to_string() == onto_commit {
+                return Ok(());
+            }
+        }
+
         let workdir = self.workdir()?;
 
-        let output = std::process::Command::new("git")
-            .args(["rebase", onto, branch])
-            .current_dir(workdir)
-            .output()?;
+        let output = match old_onto_commit {
+            Some(old_base) => {
+                // --onto <new_parent> <old_parent_tip> <branch>
+                // Only replays commits that are unique to <branch> (after old_parent_tip)
+                std::process::Command::new("git")
+                    .args(["rebase", "--onto", onto, old_base, branch])
+                    .current_dir(workdir)
+                    .output()?
+            }
+            None => std::process::Command::new("git")
+                .args(["rebase", onto, branch])
+                .current_dir(workdir)
+                .output()?,
+        };
 
         if output.status.success() {
             return Ok(());
         }
 
-        // Rebase failed — abort to clean up
-        let _ = std::process::Command::new("git")
-            .args(["rebase", "--abort"])
-            .current_dir(workdir)
-            .output();
-
+        // Leave the rebase in progress so the user can resolve conflicts
         Err(anyhow!(
-            "Rebase of '{}' onto '{}' failed due to conflicts",
+            "Rebase of '{}' onto '{}' hit conflicts.\n\
+             Resolve conflicts, stage the files, then run:\n  \
+             stax sync --continue\n\
+             To abort instead:\n  \
+             git rebase --abort",
             branch,
             onto
         ))
+    }
+
+    pub fn rebase_continue(&self) -> Result<()> {
+        let workdir = self.workdir()?;
+
+        let output = std::process::Command::new("git")
+            .args(["rebase", "--continue"])
+            .current_dir(workdir)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+
+        if output.success() {
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "git rebase --continue failed. Resolve remaining conflicts and run 'stax sync --continue' again."
+        ))
+    }
+
+    pub fn is_rebase_in_progress(&self) -> bool {
+        if let Ok(workdir) = self.workdir() {
+            let git_dir = workdir.join(".git");
+            git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists()
+        } else {
+            false
+        }
     }
 
     pub fn fetch(&self) -> Result<()> {

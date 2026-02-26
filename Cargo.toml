@@ -23,6 +23,7 @@ toml = "0.8"
 anyhow = "1.0"
 thiserror = "1.0"
 colored = "2.0"
+console = "0.15"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 dirs = "5.0"
 url = "2.4"
@@ -32,9 +33,9 @@ reqwest = { version = "0.11", features = ["json"] }
 webbrowser = "0.8"
 log = "0.4"
 env_logger = "0.11"
+tempfile = "3.8"
 
 [dev-dependencies]
-tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
 mockall = "0.12"
