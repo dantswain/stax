@@ -16,7 +16,11 @@
       "Bash(cargo test:*)",
       "Bash(echo exit: $?:*)",
       "WebSearch",
-      "WebFetch(domain:graphite.com)"
+      "WebFetch(domain:graphite.com)",
+      "Bash(git:*)",
+      "Bash(time /Users/dswain/src/stax/target/release/stax down:*)",
+      "Bash(time /Users/dswain/src/stax/target/release/stax up:*)",
+      "Bash(time /Users/dswain/src/stax/target/release/stax stack:*)"
     ],
     "deny": []
   }

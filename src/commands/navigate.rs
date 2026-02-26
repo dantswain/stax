@@ -2,6 +2,7 @@ use crate::git::GitRepo;
 use crate::utils;
 use anyhow::{anyhow, Result};
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use std::collections::HashMap;
 
 const MAIN_BRANCHES: &[&str] = &["main", "master", "develop"];
 
@@ -18,10 +19,26 @@ fn pick_branch(prompt: &str, choices: &[String]) -> Result<String> {
     Ok(choices[selection].clone())
 }
 
+/// Pre-compute commit hashes for all branches.
+fn build_commit_cache(git: &GitRepo, branches: &[String]) -> Result<HashMap<String, String>> {
+    branches
+        .iter()
+        .map(|b| {
+            let hash = git.get_commit_hash(&format!("refs/heads/{b}"))?;
+            Ok((b.clone(), hash))
+        })
+        .collect()
+}
+
 /// Find the parent of `branch` — the closest branch whose tip equals the
-/// merge-base of itself and `branch`. O(n) in the number of local branches.
-fn find_parent(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result<Option<String>> {
-    let branch_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
+/// merge-base of itself and `branch`. O(n) merge-base calls.
+fn find_parent(
+    git: &GitRepo,
+    branch: &str,
+    all_branches: &[String],
+    commits: &HashMap<String, String>,
+) -> Result<Option<String>> {
+    let branch_commit = &commits[branch];
     let mut best_parent = None;
     let mut min_distance = usize::MAX;
 
@@ -29,12 +46,12 @@ fn find_parent(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result<O
         if candidate == branch {
             continue;
         }
-        let candidate_commit = git.get_commit_hash(&format!("refs/heads/{candidate}"))?;
+        let candidate_commit = &commits[candidate];
         if candidate_commit == branch_commit {
             continue;
         }
         if let Ok(merge_base) = git.get_merge_base(branch, candidate) {
-            if merge_base.to_string() == candidate_commit {
+            if merge_base.to_string() == *candidate_commit {
                 let distance = git.count_commits_between(
                     &format!("refs/heads/{candidate}"),
                     &format!("refs/heads/{branch}"),
@@ -61,8 +78,13 @@ fn find_parent(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result<O
 
 /// Find direct children of `branch` — branches whose closest parent is
 /// `branch`. O(n) merge-base checks + O(k²) filtering among candidates.
-fn find_children(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result<Vec<String>> {
-    let branch_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
+fn find_children(
+    git: &GitRepo,
+    branch: &str,
+    all_branches: &[String],
+    commits: &HashMap<String, String>,
+) -> Result<Vec<String>> {
+    let branch_commit = &commits[branch];
 
     // Collect candidates: branches whose merge-base with `branch` equals branch's tip
     let mut candidates = Vec::new();
@@ -70,12 +92,12 @@ fn find_children(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result
         if candidate == branch || is_main_branch(candidate) {
             continue;
         }
-        let candidate_commit = git.get_commit_hash(&format!("refs/heads/{candidate}"))?;
+        let candidate_commit = &commits[candidate];
         if candidate_commit == branch_commit {
             continue;
         }
         if let Ok(merge_base) = git.get_merge_base(branch, candidate) {
-            if merge_base.to_string() == branch_commit {
+            if merge_base.to_string() == *branch_commit {
                 candidates.push(candidate.clone());
             }
         }
@@ -85,19 +107,17 @@ fn find_children(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result
     // another candidate (those are grandchildren, not children).
     let mut direct = Vec::new();
     for candidate in &candidates {
-        let candidate_commit = git.get_commit_hash(&format!("refs/heads/{candidate}"))?;
+        let candidate_commit = &commits[candidate];
         let is_grandchild = candidates.iter().any(|other| {
             if other == candidate {
                 return false;
             }
-            let other_commit = git
-                .get_commit_hash(&format!("refs/heads/{other}"))
-                .unwrap_or_default();
+            let other_commit = &commits[other];
             if other_commit == candidate_commit {
                 return false;
             }
             git.get_merge_base(candidate, other)
-                .map(|mb| mb.to_string() == other_commit)
+                .map(|mb| mb.to_string() == *other_commit)
                 .unwrap_or(false)
         });
         if !is_grandchild {
@@ -108,24 +128,13 @@ fn find_children(git: &GitRepo, branch: &str, all_branches: &[String]) -> Result
     Ok(direct)
 }
 
-/// Get all non-merged local branches (cheap: one is_merged check per branch).
-fn get_active_branches(git: &GitRepo) -> Result<Vec<String>> {
+/// Get all local branches with pre-computed commit hashes.
+/// Skips the expensive is_merged_into filtering — navigate's find_parent/
+/// find_children already handle merged branches correctly via merge-base checks.
+fn get_branches_with_cache(git: &GitRepo) -> Result<(Vec<String>, HashMap<String, String>)> {
     let all = git.get_branches()?;
-    let trunk = MAIN_BRANCHES
-        .iter()
-        .find(|name| all.contains(&name.to_string()))
-        .map(|s| s.to_string());
-
-    Ok(all
-        .into_iter()
-        .filter(|b| is_main_branch(b) || trunk.as_ref().is_none_or(|t| !is_merged_into(git, b, t)))
-        .collect())
-}
-
-fn is_merged_into(git: &GitRepo, branch: &str, trunk: &str) -> bool {
-    let branch_hash = git.get_commit_hash(&format!("refs/heads/{branch}")).ok();
-    let merge_base = git.get_merge_base(branch, trunk).ok();
-    matches!((branch_hash, merge_base), (Some(bh), Some(mb)) if bh == mb.to_string())
+    let commits = build_commit_cache(git, &all)?;
+    Ok((all, commits))
 }
 
 pub async fn down() -> Result<()> {
@@ -136,8 +145,8 @@ pub async fn down() -> Result<()> {
         return Err(anyhow!("Already at the bottom of the stack"));
     }
 
-    let branches = get_active_branches(&git)?;
-    let parent = find_parent(&git, &current, &branches)?
+    let (branches, commits) = get_branches_with_cache(&git)?;
+    let parent = find_parent(&git, &current, &branches, &commits)?
         .ok_or_else(|| anyhow!("Already at the bottom of the stack"))?;
 
     git.checkout_branch(&parent)?;
@@ -148,8 +157,8 @@ pub async fn down() -> Result<()> {
 pub async fn up() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
-    let branches = get_active_branches(&git)?;
-    let children = find_children(&git, &current, &branches)?;
+    let (branches, commits) = get_branches_with_cache(&git)?;
+    let children = find_children(&git, &current, &branches, &commits)?;
 
     let target = match children.len() {
         0 => return Err(anyhow!("Already at the top of the stack")),
@@ -165,10 +174,10 @@ pub async fn up() -> Result<()> {
 pub async fn bottom() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
-    let branches = get_active_branches(&git)?;
+    let (branches, commits) = get_branches_with_cache(&git)?;
 
     if is_main_branch(&current) {
-        let children = find_children(&git, &current, &branches)?;
+        let children = find_children(&git, &current, &branches, &commits)?;
         return match children.len() {
             0 => {
                 utils::print_info("No stack branches above main");
@@ -191,7 +200,7 @@ pub async fn bottom() -> Result<()> {
     // Walk parent chain until parent is a main branch (or None)
     let mut target = current.clone();
     loop {
-        let parent = find_parent(&git, &target, &branches)?;
+        let parent = find_parent(&git, &target, &branches, &commits)?;
         match parent {
             Some(p) if is_main_branch(&p) => break,
             Some(p) => target = p,
@@ -212,12 +221,12 @@ pub async fn bottom() -> Result<()> {
 pub async fn top() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
-    let branches = get_active_branches(&git)?;
+    let (branches, commits) = get_branches_with_cache(&git)?;
 
     // Walk children until reaching a leaf, prompting at forks
     let mut target = current.clone();
     loop {
-        let children = find_children(&git, &target, &branches)?;
+        let children = find_children(&git, &target, &branches, &commits)?;
         match children.len() {
             0 => break,
             1 => target = children[0].clone(),

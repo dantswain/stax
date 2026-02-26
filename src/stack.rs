@@ -53,7 +53,7 @@ impl Stack {
         };
 
         // Do expensive local git work while the bulk fetch is in flight
-        let relationships = Self::detect_relationships(git, &branches)?;
+        let (relationships, commits) = Self::detect_relationships(git, &branches)?;
 
         // Collect bulk PR results
         let mut prs: HashMap<String, PullRequest> = HashMap::new();
@@ -90,7 +90,7 @@ impl Stack {
 
         let mut stack_branches = HashMap::new();
         for branch_name in &branches {
-            let commit_hash = git.get_commit_hash(&format!("refs/heads/{branch_name}"))?;
+            let commit_hash = commits.get(branch_name).cloned().unwrap_or_default();
             let pull_request = prs.get(branch_name).cloned();
             let is_current = branch_name == &current_branch;
 
@@ -129,9 +129,22 @@ impl Stack {
         })
     }
 
-    fn detect_relationships(git: &GitRepo, branches: &[String]) -> Result<Vec<(String, String)>> {
+    #[allow(clippy::type_complexity)]
+    fn detect_relationships(
+        git: &GitRepo,
+        branches: &[String],
+    ) -> Result<(Vec<(String, String)>, HashMap<String, String>)> {
         let mut relationships = Vec::new();
         let main_branches = ["main", "master", "develop"];
+
+        // Pre-compute all commit hashes once (avoids redundant calls in inner loop)
+        let commits: HashMap<String, String> = branches
+            .iter()
+            .map(|b| {
+                let hash = git.get_commit_hash(&format!("refs/heads/{b}"))?;
+                Ok((b.clone(), hash))
+            })
+            .collect::<Result<_>>()?;
 
         // Find the trunk branch for fallback and merged-branch detection
         let trunk = main_branches
@@ -139,19 +152,26 @@ impl Stack {
             .find(|name| branches.contains(&name.to_string()))
             .map(|s| s.to_string());
 
+        // Pre-compute merged status once per branch
+        let merged: HashSet<String> = if let Some(ref trunk_name) = trunk {
+            branches
+                .iter()
+                .filter(|b| {
+                    !main_branches.contains(&b.as_str())
+                        && is_merged_into_cached(&commits, git, b, trunk_name)
+                })
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         for branch in branches {
-            if main_branches.contains(&branch.as_str()) {
+            if main_branches.contains(&branch.as_str()) || merged.contains(branch) {
                 continue;
             }
 
-            // Skip branches that are fully merged into trunk
-            if let Some(ref trunk_name) = trunk {
-                if is_merged_into(git, branch, trunk_name) {
-                    continue;
-                }
-            }
-
-            let current_commit = git.get_commit_hash(&format!("refs/heads/{branch}"))?;
+            let current_commit = &commits[branch];
             let mut best_parent = None;
             let mut min_distance = usize::MAX;
 
@@ -160,25 +180,21 @@ impl Stack {
                     continue;
                 }
 
-                let parent_commit =
-                    git.get_commit_hash(&format!("refs/heads/{potential_parent}"))?;
+                let parent_commit = &commits[potential_parent];
 
-                // Skip if both branches point to the same commit (they're siblings, not parent-child)
                 if current_commit == parent_commit {
                     continue;
                 }
 
-                // Skip non-trunk branches whose tip is an ancestor of trunk (they're merged)
-                if !main_branches.contains(&potential_parent.as_str()) {
-                    if let Some(ref trunk_name) = trunk {
-                        if is_merged_into(git, potential_parent, trunk_name) {
-                            continue;
-                        }
-                    }
+                // Skip merged non-trunk branches
+                if !main_branches.contains(&potential_parent.as_str())
+                    && merged.contains(potential_parent)
+                {
+                    continue;
                 }
 
                 if let Ok(merge_base) = git.get_merge_base(branch, potential_parent) {
-                    if merge_base.to_string() == parent_commit {
+                    if merge_base.to_string() == *parent_commit {
                         let distance = git.count_commits_between(
                             &format!("refs/heads/{potential_parent}"),
                             &format!("refs/heads/{branch}"),
@@ -203,7 +219,7 @@ impl Stack {
             }
         }
 
-        Ok(relationships)
+        Ok((relationships, commits))
     }
 
     pub fn get_stack_for_branch(&self, branch_name: &str) -> Vec<&StackBranch> {
@@ -259,6 +275,23 @@ fn is_merged_into(git: &GitRepo, branch: &str, trunk: &str) -> bool {
     match (branch_hash, merge_base) {
         (Some(bh), Some(mb)) => bh == mb.to_string(),
         _ => false,
+    }
+}
+
+/// Same check but uses pre-computed commit hashes to avoid redundant lookups.
+fn is_merged_into_cached(
+    commits: &HashMap<String, String>,
+    git: &GitRepo,
+    branch: &str,
+    trunk: &str,
+) -> bool {
+    let Some(branch_hash) = commits.get(branch) else {
+        return false;
+    };
+    let merge_base = git.get_merge_base(branch, trunk).ok();
+    match merge_base {
+        Some(mb) => *branch_hash == mb.to_string(),
+        None => false,
     }
 }
 
