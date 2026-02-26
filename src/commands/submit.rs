@@ -2,6 +2,8 @@ use crate::{config::Config, git::GitRepo, github::GitHubClient, stack::Stack, to
 use anyhow::{anyhow, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 
+const STACK_COMMENT_MARKER: &str = "<!-- stax-stack-comment -->";
+
 pub async fn run(all: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
@@ -67,10 +69,21 @@ async fn submit_current_branch(
         if update {
             update_existing_pr(github, existing_pr.number, config).await?;
         }
+
+        // Update stack comments on all PRs
+        let fresh_stack = Stack::analyze(git, Some(github)).await?;
+        update_stack_comments(github, &fresh_stack).await?;
+
         return Ok(());
     }
 
-    create_new_pr(git, github, current_branch, stack, config).await
+    create_new_pr(git, github, current_branch, stack, config).await?;
+
+    // Re-analyze to pick up newly created PR, then update stack comments
+    let fresh_stack = Stack::analyze(git, Some(github)).await?;
+    update_stack_comments(github, &fresh_stack).await?;
+
+    Ok(())
 }
 
 async fn submit_stack(
@@ -106,6 +119,11 @@ async fn submit_stack(
     }
 
     utils::print_success("Stack submission completed!");
+
+    // Re-analyze to pick up newly created PRs, then update stack comments
+    let fresh_stack = Stack::analyze(git, Some(github)).await?;
+    update_stack_comments(github, &fresh_stack).await?;
+
     Ok(())
 }
 
@@ -203,6 +221,300 @@ async fn create_new_pr(
     }
 
     Ok(())
+}
+
+fn render_stack_comment(stack: &Stack, current_pr_number: u64) -> String {
+    let current_branch = &stack.current_branch;
+    let stack_branches = stack.get_stack_for_branch(current_branch);
+
+    // Filter to branches that have PRs (skip main/branches without PRs)
+    let branches_with_prs: Vec<_> = stack_branches
+        .iter()
+        .filter(|b| b.pull_request.is_some())
+        .collect();
+
+    let mut lines = vec![
+        STACK_COMMENT_MARKER.to_string(),
+        "### Stack".to_string(),
+        "| # | Branch | PR | |".to_string(),
+        "|---|--------|----|-|".to_string(),
+    ];
+
+    for (i, branch) in branches_with_prs.iter().enumerate() {
+        let pr = branch.pull_request.as_ref().unwrap();
+        let num = i + 1;
+        let is_current = pr.number == current_pr_number;
+
+        let row = if is_current {
+            format!(
+                "| {num} | **{}** | **[#{}]({})** | **\u{2190} this PR** |",
+                branch.name, pr.number, pr.html_url
+            )
+        } else {
+            format!(
+                "| {num} | {} | [#{}]({}) | |",
+                branch.name, pr.number, pr.html_url
+            )
+        };
+        lines.push(row);
+    }
+
+    lines.join("\n")
+}
+
+async fn update_stack_comments(github: &GitHubClient, stack: &Stack) -> Result<()> {
+    let current_branch = &stack.current_branch;
+    let stack_branches = stack.get_stack_for_branch(current_branch);
+
+    let branches_with_prs: Vec<_> = stack_branches
+        .iter()
+        .filter(|b| b.pull_request.is_some())
+        .collect();
+
+    if branches_with_prs.is_empty() {
+        return Ok(());
+    }
+
+    utils::print_info("Updating stack comments on PRs...");
+
+    for branch in &branches_with_prs {
+        let pr = branch.pull_request.as_ref().unwrap();
+        let comment_body = render_stack_comment(stack, pr.number);
+
+        let comments = github.list_pr_comments(pr.number).await?;
+        let existing = comments
+            .iter()
+            .find(|(_, body)| body.contains(STACK_COMMENT_MARKER));
+
+        match existing {
+            Some((comment_id, _)) => {
+                github.update_pr_comment(*comment_id, &comment_body).await?;
+            }
+            None => {
+                github.create_pr_comment(pr.number, &comment_body).await?;
+            }
+        }
+    }
+
+    utils::print_success("Stack comments updated on all PRs");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::PullRequest;
+    use crate::stack::{Stack, StackBranch};
+    use std::collections::HashMap;
+
+    fn make_pr(number: u64, branch: &str) -> PullRequest {
+        PullRequest {
+            number,
+            title: format!("PR for {branch}"),
+            body: None,
+            state: "open".to_string(),
+            head_ref: branch.to_string(),
+            base_ref: "main".to_string(),
+            html_url: format!("https://github.com/owner/repo/pull/{number}"),
+            draft: false,
+        }
+    }
+
+    fn make_branch(
+        name: &str,
+        parent: Option<&str>,
+        children: Vec<&str>,
+        pr: Option<PullRequest>,
+    ) -> StackBranch {
+        StackBranch {
+            name: name.to_string(),
+            parent: parent.map(|s| s.to_string()),
+            children: children.into_iter().map(|s| s.to_string()).collect(),
+            commit_hash: "abc123".to_string(),
+            pull_request: pr,
+            is_current: false,
+        }
+    }
+
+    /// main -> A (#1) -> B (#2) -> C (#3), current_branch = B
+    fn make_linear_stack() -> Stack {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C"], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+
+        Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "B".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_render_stack_comment_contains_marker() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        assert!(comment.starts_with(STACK_COMMENT_MARKER));
+    }
+
+    #[test]
+    fn test_render_stack_comment_contains_header() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        assert!(comment.contains("### Stack"));
+        assert!(comment.contains("| # | Branch | PR | |"));
+    }
+
+    #[test]
+    fn test_render_stack_comment_current_pr_is_bolded() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+
+        // PR #2 (branch B) should be bolded with arrow
+        assert!(comment.contains("| **B** |"));
+        assert!(comment.contains("**[#2]"));
+        assert!(comment.contains("\u{2190} this PR"));
+    }
+
+    #[test]
+    fn test_render_stack_comment_other_prs_not_bolded() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+
+        // PR #1 (branch A) should NOT be bolded
+        assert!(comment.contains("| A |"));
+        assert!(comment.contains("[#1](https://github.com/owner/repo/pull/1)"));
+        // PR #3 (branch C) should NOT be bolded
+        assert!(comment.contains("| C |"));
+        assert!(comment.contains("[#3](https://github.com/owner/repo/pull/3)"));
+    }
+
+    #[test]
+    fn test_render_stack_comment_numbering() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        let lines: Vec<&str> = comment.lines().collect();
+
+        // After header (marker, title, col header, separator) we have 3 data rows
+        // Row for A should be #1
+        assert!(lines.iter().any(|l| l.starts_with("| 1 | A |")));
+        // Row for B should be #2
+        assert!(lines.iter().any(|l| l.starts_with("| 2 | **B** |")));
+        // Row for C should be #3
+        assert!(lines.iter().any(|l| l.starts_with("| 3 | C |")));
+    }
+
+    #[test]
+    fn test_render_stack_comment_skips_branches_without_prs() {
+        let stack = make_linear_stack();
+        // main has no PR, so it shouldn't appear in the table
+        let comment = render_stack_comment(&stack, 1);
+        assert!(!comment.contains("| main |"));
+        // Only 3 data rows (A, B, C)
+        let data_rows: Vec<&str> = comment
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| #") && !l.starts_with("|--"))
+            .collect();
+        assert_eq!(data_rows.len(), 3);
+    }
+
+    #[test]
+    fn test_render_stack_comment_single_pr() {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["feat"], None),
+        );
+        branches.insert(
+            "feat".to_string(),
+            make_branch("feat", Some("main"), vec![], Some(make_pr(10, "feat"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "feat".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 10);
+        assert!(comment.contains(STACK_COMMENT_MARKER));
+        assert!(comment.contains("| 1 | **feat** |"));
+        assert!(comment.contains("\u{2190} this PR"));
+        // Only one data row
+        let data_rows: Vec<&str> = comment
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| #") && !l.starts_with("|--"))
+            .collect();
+        assert_eq!(data_rows.len(), 1);
+    }
+
+    #[test]
+    fn test_render_stack_comment_different_current_per_pr() {
+        let stack = make_linear_stack();
+
+        // Rendered for PR #1 — A should be current
+        let comment_a = render_stack_comment(&stack, 1);
+        assert!(comment_a.contains("| **A** |"));
+        assert!(comment_a.contains("| B |"));
+        assert!(comment_a.contains("| C |"));
+
+        // Rendered for PR #3 — C should be current
+        let comment_c = render_stack_comment(&stack, 3);
+        assert!(comment_c.contains("| A |"));
+        assert!(comment_c.contains("| B |"));
+        assert!(comment_c.contains("| **C** |"));
+    }
+
+    #[test]
+    fn test_render_stack_comment_mixed_pr_coverage() {
+        // A has PR, B does not, C has PR
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C"], None),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "C".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 3);
+
+        // B should be skipped (no PR) — only A and C appear
+        let data_rows: Vec<&str> = comment
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.starts_with("| #") && !l.starts_with("|--"))
+            .collect();
+        assert_eq!(data_rows.len(), 2);
+        assert!(comment.contains("| 1 | A |"));
+        assert!(comment.contains("| 2 | **C** |"));
+        assert!(!comment.contains("| B |"));
+    }
 }
 
 async fn update_existing_pr(github: &GitHubClient, pr_number: u64, _config: &Config) -> Result<()> {
