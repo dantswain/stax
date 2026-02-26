@@ -46,8 +46,6 @@ enum Commands {
         #[arg(long, help = "Continue after resolving rebase conflicts")]
         r#continue: bool,
     },
-    #[command(about = "Delete branch, update dependents")]
-    Delete { branch: String },
     #[command(about = "Move up the stack (away from main)")]
     Up,
     #[command(about = "Move down the stack (toward main)")]
@@ -89,7 +87,6 @@ async fn main() {
             r#continue,
         } => sync::run(no_restack, force, r#continue).await,
         Commands::Restack { all, r#continue } => restack::run(all, r#continue).await,
-        Commands::Delete { branch } => delete::run(&branch).await,
         Commands::Up => navigate::up().await,
         Commands::Down => navigate::down().await,
         Commands::Top => navigate::top().await,
