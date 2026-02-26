@@ -62,6 +62,9 @@ async fn submit_current_branch(
         .get(current_branch)
         .ok_or_else(|| anyhow!("Current branch not found in stack"))?;
 
+    // Push branch to remote (force-push if diverged after rebase)
+    push_branch(git, config, current_branch)?;
+
     // Check if PR already exists
     if let Some(existing_pr) = &current_stack_branch.pull_request {
         utils::print_info(&format!("PR already exists: {}", existing_pr.html_url));
@@ -133,6 +136,36 @@ async fn submit_stack(
     Ok(())
 }
 
+/// Push a branch to remote, force-pushing with lease if it has diverged (e.g. after rebase).
+fn push_branch(git: &GitRepo, config: &Config, branch_name: &str) -> Result<()> {
+    if git.has_diverged_from_remote(branch_name)? {
+        utils::print_info(&format!(
+            "Branch '{branch_name}' has diverged from remote, force-pushing..."
+        ));
+        git.push_branch(branch_name, true)?;
+        utils::print_success(&format!("Force-pushed '{branch_name}'"));
+    } else if !git.has_remote_branch(branch_name)? {
+        if config.auto_push {
+            utils::print_info(&format!("Pushing branch '{branch_name}' to remote..."));
+            git.push_branch(branch_name, false)?;
+        } else {
+            let should_push = Confirm::with_theme(&ColorfulTheme::default())
+                .with_prompt(format!(
+                    "Branch '{branch_name}' not found on remote. Push now?"
+                ))
+                .default(true)
+                .interact()?;
+
+            if should_push {
+                git.push_branch(branch_name, false)?;
+            } else {
+                return Err(anyhow!("Cannot create PR without pushing branch to remote"));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn create_new_pr(
     git: &GitRepo,
     github: &GitHubClient,
@@ -151,29 +184,8 @@ async fn create_new_pr(
         .as_ref()
         .unwrap_or(&config.default_base_branch);
 
-    // Auto-push if configured
-    if config.auto_push {
-        if !git.has_remote_branch(branch_name)? {
-            utils::print_info(&format!("Pushing branch '{branch_name}' to remote..."));
-            git.push_branch(branch_name, false)?;
-        }
-    } else {
-        // Check if branch exists on remote
-        if !git.has_remote_branch(branch_name)? {
-            let should_push = Confirm::with_theme(&ColorfulTheme::default())
-                .with_prompt(format!(
-                    "Branch '{branch_name}' not found on remote. Push now?"
-                ))
-                .default(true)
-                .interact()?;
-
-            if should_push {
-                git.push_branch(branch_name, false)?;
-            } else {
-                return Err(anyhow!("Cannot create PR without pushing branch to remote"));
-            }
-        }
-    }
+    // Push branch to remote (force-push if diverged after rebase)
+    push_branch(git, config, branch_name)?;
 
     git.ensure_tracking_branch(branch_name)?;
 
