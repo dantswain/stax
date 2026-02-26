@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use colored::*;
+use console::{Key, Term};
 use std::io::{self, Write};
 
 pub fn print_success(msg: &str) {
@@ -36,6 +37,83 @@ pub fn prompt(msg: &str) -> Result<String> {
     io::stdin().read_line(&mut input)?;
 
     Ok(input.trim().to_string())
+}
+
+/// Single-line text input that supports Ctrl+G to open $EDITOR.
+/// Returns `Ok(None)` if the user pressed Ctrl+G (caller should open editor).
+/// Returns `Ok(Some(text))` for normal text entry.
+pub fn input_or_editor(prompt_msg: &str) -> Result<Option<String>> {
+    let term = Term::stderr();
+    let mut buf = String::new();
+
+    eprint!(
+        "{} {} {}: ",
+        "?".cyan().bold(),
+        prompt_msg,
+        "(Ctrl+G for editor)".dimmed()
+    );
+    io::stderr().flush()?;
+
+    loop {
+        let key = term.read_key()?;
+        match key {
+            Key::Char('\x07') => {
+                // Ctrl+G — clear the line and signal editor
+                term.clear_line()?;
+                eprintln!("{} {} opening editor...", "?".cyan().bold(), prompt_msg,);
+                return Ok(None);
+            }
+            Key::Enter => {
+                term.write_line("")?;
+                return Ok(Some(buf));
+            }
+            Key::Backspace => {
+                if !buf.is_empty() {
+                    buf.pop();
+                    // Move cursor back, overwrite with space, move back again
+                    eprint!("\x08 \x08");
+                    io::stderr().flush()?;
+                }
+            }
+            Key::Char(c) => {
+                buf.push(c);
+                eprint!("{c}");
+                io::stderr().flush()?;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Open $VISUAL / $EDITOR (with shell expansion) to edit `initial` text.
+/// Returns the edited text, or an error if no editor is available.
+pub fn open_editor(initial: &str) -> Result<String> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix("stax-")
+        .suffix(".md")
+        .tempfile()?;
+    tmp.write_all(initial.as_bytes())?;
+    tmp.flush()?;
+
+    let path = tmp.path().to_owned();
+
+    // Invoke through shell so env vars like $HOME get expanded
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{} \"{}\"", editor, path.display()))
+        .status()?;
+
+    if !status.success() {
+        return Err(anyhow!("Editor exited with non-zero status"));
+    }
+
+    Ok(std::fs::read_to_string(&path)?
+        .trim_end_matches('\n')
+        .to_string())
 }
 
 #[allow(dead_code)]

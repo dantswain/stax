@@ -6,7 +6,7 @@ use crate::{
     token_store, utils,
 };
 use anyhow::{anyhow, Result};
-use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Input};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input};
 
 const STACK_COMMENT_MARKER: &str = "<!-- stax-stack-comment -->";
 
@@ -201,21 +201,11 @@ async fn create_new_pr(
         return Err(anyhow!("PR title cannot be empty"));
     }
 
-    // Get PR body (type :e to open $EDITOR)
+    // Get PR body (Ctrl+G opens $EDITOR)
     let default_body = config.pr_template.as_deref().unwrap_or("");
-    let raw_body: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("PR description (:e for editor)")
-        .default(default_body.to_string())
-        .allow_empty(true)
-        .interact_text()?;
-
-    let body: String = if raw_body.trim() == ":e" {
-        Editor::new()
-            .extension(".md")
-            .edit(default_body)?
-            .unwrap_or_default()
-    } else {
-        raw_body
+    let body: String = match utils::input_or_editor("PR description")? {
+        Some(text) => text,
+        None => utils::open_editor(default_body)?,
     };
 
     // Create the PR
