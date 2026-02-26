@@ -178,11 +178,24 @@ async fn create_new_pr(
         .get(branch_name)
         .ok_or_else(|| anyhow!("Branch not found in stack"))?;
 
-    // Determine the base branch (parent or default)
-    let base_branch = branch
+    // Determine the base branch (parent or default).
+    // If the detected parent doesn't exist on the remote, fall back to the default.
+    let detected_base = branch
         .parent
         .as_ref()
         .unwrap_or(&config.default_base_branch);
+
+    let base_branch = if git.has_remote_branch(detected_base)? {
+        detected_base.clone()
+    } else {
+        utils::print_warning(&format!(
+            "Base branch '{detected_base}' not found on remote, using '{}' instead. \
+             Run 'stax sync' to update stack relationships.",
+            config.default_base_branch
+        ));
+        config.default_base_branch.clone()
+    };
+    let base_branch = &base_branch;
 
     // Push branch to remote (force-push if diverged after rebase)
     push_branch(git, config, branch_name)?;
