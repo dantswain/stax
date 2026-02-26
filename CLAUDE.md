@@ -41,29 +41,32 @@ All commands follow this pattern:
 5. Return `Result<()>`
 
 ### Core Modules
-- **`git.rs`**: Wraps `git2` crate. `GitRepo` struct provides branch operations, push, merge-base detection. SSH auth tries key files directly (agent auth commented out due to loop issue). HTTPS auth reads `GITHUB_TOKEN` env var or git config.
-- **`github.rs`**: `GitHubClient` wraps `octocrab`. Parses both HTTPS and SSH remote URLs via `parse_github_url()`. Custom `PullRequest` struct (not octocrab's) used throughout.
-- **`stack.rs`**: `Stack::analyze()` builds the branch graph. `detect_relationships()` infers parent-child by checking if a branch's merge-base with another equals that branch's tip (closest such branch wins). Falls back to main/master/develop as parent.
+- **`git.rs`**: Wraps `git2` crate. `GitRepo` struct provides branch operations, push (with force-push-with-lease), merge-base detection, `rebase_onto_with_base` (uses `--onto` to avoid replaying parent commits), `rebase_continue`, `is_rebase_in_progress`, and `has_diverged_from_remote`. SSH auth tries key files directly (agent auth commented out due to loop issue).
+- **`github.rs`**: `GitHubClient` wraps `octocrab`. Parses both HTTPS and SSH remote URLs via `parse_github_url()`. Custom `PullRequest` struct (not octocrab's) used throughout. `format_github_error()` extracts useful messages from octocrab's opaque error types. Includes PR comment methods for stack visualization.
+- **`stack.rs`**: `Stack::analyze()` builds the branch graph. `detect_relationships()` infers parent-child by checking if a branch's merge-base with another equals that branch's tip (closest such branch wins). Pre-computes commit hashes and merged-branch status to avoid redundant git calls. Falls back to main/master/develop as parent.
 - **`config.rs`**: TOML config at XDG-compliant paths. Key fields: `default_base_branch`, `auto_push`, `draft_prs`, `pr_template`.
 - **`oauth.rs`**: GitHub device flow auth (uses GitHub CLI's client ID: `178c6fc778ccc68e1d6a`).
 - **`token_store.rs`**: Token stored at `~/.stax/token` with 0o600 permissions.
-- **`utils.rs`**: `print_success/info/warning/error` colored output, `confirm()` prompts via `dialoguer`.
+- **`utils.rs`**: `print_success/info/warning/error` colored output, `confirm()` prompts, `input_or_editor()` (Ctrl+G to open `$EDITOR`), `open_editor()` (invokes editor via shell for proper env var expansion).
 
 ### Available Commands
-- `stax init` - Interactive setup with OAuth or token authentication
-- `stax branch [name]` - Create branch with parent relationship tracking
+- `stax auth [login|status]` - GitHub authentication (OAuth or token)
+- `stax create [name]` - Create branch with parent relationship tracking
 - `stax stack` - Visual tree display of branch relationships
-- `stax submit [--all]` - Create/update PRs; `--all` submits entire stack
-- `stax sync [--all]` - Sync with remote
-- `stax restack [--all]` - Rebase branches on parents
-- `stax delete <branch>` - Delete branch and update dependents
+- `stax submit [--all]` - Create/update PRs; `--all` submits entire stack; auto-pushes and force-pushes after rebase
+- `stax sync [--no-restack] [--force] [--continue]` - Fetch, fast-forward trunk, clean up merged branches, restack
+- `stax restack [--all] [--continue]` - Rebase branches on parents
+- `stax up` / `stax down` / `stax top` / `stax bottom` - Navigate the stack
 - `stax status` - Show current repository status
 - `stax config set/get/list` - Configuration management
 
 ## Key Patterns
 
 - All command functions are async (Tokio runtime)
-- Interactive UX via `dialoguer` (confirmations, text input, fuzzy-select)
+- Interactive UX via `dialoguer` (confirmations, text input, fuzzy-select) and `console` (Ctrl+G keybinding)
 - `GitRepo` does not use `git2::Repository::open()` directly — it uses `discover()` which walks up to find the `.git` directory
 - Stack relationship detection is heuristic (merge-base analysis), not stored metadata
+- Rebase uses `git rebase --onto` with pre-rebase parent tips to avoid replaying parent commits
+- On rebase conflict, the rebase is left in progress for the user to resolve; `--continue` resumes
 - Main/master/develop are treated as root branches and excluded from PR operations
+- Navigate commands (`up`/`down`/`top`/`bottom`) do targeted O(n) lookups instead of full O(n²) stack analysis

@@ -19,3 +19,5 @@ perf.data*
 
 # Benchmark results
 criterion/
+
+.claude/

@@ -65,21 +65,10 @@ async fn submit_current_branch(
     // Push branch to remote (force-push if diverged after rebase)
     push_branch(git, config, current_branch)?;
 
-    // Check if PR already exists
+    // If PR already exists, just push and update stack comments
     if let Some(existing_pr) = &current_stack_branch.pull_request {
-        utils::print_info(&format!("PR already exists: {}", existing_pr.html_url));
+        utils::print_success(&format!("Updated PR: {}", existing_pr.html_url));
 
-        // Ask if they want to update it
-        let update = Confirm::with_theme(&ColorfulTheme::default())
-            .with_prompt("Update existing PR?")
-            .default(false)
-            .interact()?;
-
-        if update {
-            update_existing_pr(github, existing_pr.number, config).await?;
-        }
-
-        // Update stack comments on all PRs
         let fresh_stack = Stack::analyze(git, Some(github)).await?;
         update_stack_comments(github, &fresh_stack).await?;
 
@@ -178,11 +167,24 @@ async fn create_new_pr(
         .get(branch_name)
         .ok_or_else(|| anyhow!("Branch not found in stack"))?;
 
-    // Determine the base branch (parent or default)
-    let base_branch = branch
+    // Determine the base branch (parent or default).
+    // If the detected parent doesn't exist on the remote, fall back to the default.
+    let detected_base = branch
         .parent
         .as_ref()
         .unwrap_or(&config.default_base_branch);
+
+    let base_branch = if git.has_remote_branch(detected_base)? {
+        detected_base.clone()
+    } else {
+        utils::print_warning(&format!(
+            "Base branch '{detected_base}' not found on remote, using '{}' instead. \
+             Run 'stax sync' to update stack relationships.",
+            config.default_base_branch
+        ));
+        config.default_base_branch.clone()
+    };
+    let base_branch = &base_branch;
 
     // Push branch to remote (force-push if diverged after rebase)
     push_branch(git, config, branch_name)?;
@@ -736,46 +738,4 @@ mod tests {
         assert!(items[2].starts_with("- **`A`"));
         assert!(!comment.contains("`B`"));
     }
-}
-
-async fn update_existing_pr(github: &GitHubClient, pr_number: u64, _config: &Config) -> Result<()> {
-    // Get new title
-    let title: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("New PR title (leave empty to keep current)")
-        .allow_empty(true)
-        .interact_text()?;
-
-    // Get new body
-    let body: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("New PR description (leave empty to keep current)")
-        .allow_empty(true)
-        .interact_text()?;
-
-    let title_option = if title.trim().is_empty() {
-        None
-    } else {
-        Some(title.as_str())
-    };
-    let body_option = if body.trim().is_empty() {
-        None
-    } else {
-        Some(body.as_str())
-    };
-
-    if title_option.is_none() && body_option.is_none() {
-        utils::print_info("No changes made to PR");
-        return Ok(());
-    }
-
-    let updated_pr = github
-        .update_pull_request(
-            pr_number,
-            title_option,
-            body_option,
-            None, // Don't change base branch
-        )
-        .await?;
-
-    utils::print_success(&format!("PR updated: {}", updated_pr.html_url));
-    Ok(())
 }

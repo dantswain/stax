@@ -22,7 +22,7 @@ enum Commands {
         command: Option<AuthCommands>,
     },
     #[command(about = "Create new branch")]
-    Branch { name: Option<String> },
+    Create { name: Option<String> },
     #[command(about = "Show visual stack structure")]
     Stack,
     #[command(about = "Create/update PRs")]
@@ -46,8 +46,6 @@ enum Commands {
         #[arg(long, help = "Continue after resolving rebase conflicts")]
         r#continue: bool,
     },
-    #[command(about = "Delete branch, update dependents")]
-    Delete { branch: String },
     #[command(about = "Move up the stack (away from main)")]
     Up,
     #[command(about = "Move down the stack (toward main)")]
@@ -80,7 +78,7 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Auth { command } => auth::run(command).await,
-        Commands::Branch { name } => branch::run(name.as_deref()).await,
+        Commands::Create { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
         Commands::Submit { all } => submit::run(all).await,
         Commands::Sync {
@@ -89,7 +87,6 @@ async fn main() {
             r#continue,
         } => sync::run(no_restack, force, r#continue).await,
         Commands::Restack { all, r#continue } => restack::run(all, r#continue).await,
-        Commands::Delete { branch } => delete::run(&branch).await,
         Commands::Up => navigate::up().await,
         Commands::Down => navigate::down().await,
         Commands::Top => navigate::top().await,

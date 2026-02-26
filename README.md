@@ -114,7 +114,7 @@ draft_prs = false
 
 ```bash
 # Create a new branch
-stax branch feature-name
+stax create feature-name
 
 # Show stack visualization
 stax stack
@@ -122,7 +122,7 @@ stax stack
 # Show current status
 stax status
 
-# Submit PR for current branch
+# Submit PR for current branch (auto-pushes, force-pushes after rebase)
 stax submit
 
 # Submit PRs for entire stack
@@ -131,12 +131,28 @@ stax submit --all
 # Sync current branch with its parent
 stax sync
 
+# Continue sync after resolving rebase conflicts
+stax sync --continue
+
 # Restack all branches
 stax restack --all
 
-# Delete a branch and update dependents
-stax delete branch-name
+# Continue restack after resolving rebase conflicts
+stax restack --continue
 ```
+
+### Stack Navigation
+
+Move between branches in a stack without typing branch names:
+
+```bash
+stax up       # Move to child branch (away from main)
+stax down     # Move to parent branch (toward main)
+stax top      # Jump to the leaf (topmost branch)
+stax bottom   # Jump to the first branch above main
+```
+
+When a branch has multiple children, you'll be prompted to pick one.
 
 ### Configuration Management
 
@@ -240,7 +256,7 @@ cargo fmt
 
 ## Testing Coverage
 
-The project includes 75+ tests across unit and integration suites:
+The project includes 88+ tests across unit and integration suites:
 
 - **Unit Tests** (in-module `#[cfg(test)]`):
   - `config.rs` — Config defaults, set/get, TOML generation, path resolution
@@ -265,7 +281,7 @@ src/
 │   ├── auth.rs          # GitHub authentication (login/status)
 │   ├── branch.rs        # Branch creation
 │   ├── config.rs        # Configuration management
-│   ├── delete.rs        # Branch deletion
+│   ├── navigate.rs      # Stack navigation (up/down/top/bottom)
 │   ├── restack.rs       # Branch restacking
 │   ├── stack.rs         # Stack visualization
 │   ├── status.rs        # Status display
@@ -300,9 +316,10 @@ tests/
 - `reqwest` - HTTP client for OAuth device flow
 - `webbrowser` - Open browser for authentication
 - `dirs` - Directory paths for secure token storage
+- `console` - Terminal key input (Ctrl+G editor shortcut)
+- `tempfile` - Temporary files for editor integration
 
 ### Development Dependencies
-- `tempfile` - Temporary files for testing
 - `assert_cmd` - Command-line testing
 - `predicates` - Test assertions
 - `mockall` - Mocking framework
@@ -310,7 +327,7 @@ tests/
 ## Contributing
 
 1. Fork the repository
-2. Create a feature branch (`stax branch your-feature`)
+2. Create a feature branch (`stax create your-feature`)
 3. Make your changes
 4. Ensure tests pass (`cargo test`)
 5. Ensure linting passes (`cargo clippy -- -D warnings`)
