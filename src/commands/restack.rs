@@ -2,6 +2,7 @@ use crate::git::GitRepo;
 use crate::stack::Stack;
 use crate::utils;
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 
 pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
@@ -65,11 +66,24 @@ pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Snapshot branch tips BEFORE any rebasing for --onto
+    let mut old_tips: HashMap<String, String> = HashMap::new();
+    for (branch, parent) in &branches_to_rebase {
+        for name in [branch, parent] {
+            if !old_tips.contains_key(name) {
+                if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
+                    old_tips.insert(name.clone(), hash);
+                }
+            }
+        }
+    }
+
     let mut restacked = Vec::new();
 
     for (branch, parent) in &branches_to_rebase {
         utils::print_info(&format!("Rebasing '{}' onto '{}'", branch, parent));
-        git.rebase_onto(branch, parent)?;
+        let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
+        git.rebase_onto_with_base(branch, parent, old_parent_tip)?;
         restacked.push(branch.as_str());
     }
 

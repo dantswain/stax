@@ -146,7 +146,12 @@ async fn restack_branches(
     github: &GitHubClient,
     _original_branch: &str,
 ) -> Result<()> {
-    let stack = Stack::analyze(git, Some(github)).await?;
+    restack_all(git, Some(github)).await
+}
+
+/// Shared restack logic used by both normal sync and --continue.
+async fn restack_all(git: &GitRepo, github: Option<&GitHubClient>) -> Result<()> {
+    let stack = Stack::analyze(git, github).await?;
     let main_branches = ["main", "master", "develop"];
 
     // Collect branches with their parents and depth for topological ordering.
@@ -170,16 +175,29 @@ async fn restack_branches(
         return Ok(());
     }
 
+    // Snapshot ALL branch tips BEFORE any rebasing.
+    // When rebasing B onto A, we use A's OLD tip as the --onto base so that
+    // only B's own commits get replayed (not A's original commits).
+    let mut old_tips: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (branch, parent, _) in &to_rebase {
+        for name in [branch, parent] {
+            if !old_tips.contains_key(name) {
+                if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
+                    old_tips.insert(name.clone(), hash);
+                }
+            }
+        }
+    }
+
     let mut restacked = Vec::new();
 
     for (branch, parent, _) in &to_rebase {
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
-        match git.rebase_onto(branch, parent) {
+        // Use the parent's pre-rebase tip so --onto only replays branch's own commits
+        let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
+        match git.rebase_onto_with_base(branch, parent, old_parent_tip) {
             Ok(()) => restacked.push(branch.as_str()),
-            Err(e) => {
-                // Leave the user in the rebase flow to resolve conflicts
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
 
@@ -193,42 +211,14 @@ async fn restack_branches(
 /// Continue a sync after the user has resolved rebase conflicts.
 /// Finishes the in-progress rebase, then restacks any remaining branches.
 async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()> {
-    // 1. Finish the in-progress rebase
     if git.is_rebase_in_progress() {
         utils::print_info("Continuing rebase...");
         git.rebase_continue()?;
         utils::print_success("Rebase continued successfully");
     }
 
-    // 2. Re-analyze and restack remaining branches
-    let stack = Stack::analyze(git, None).await?;
-    let main_branches = ["main", "master", "develop"];
-
-    let mut to_rebase: Vec<(String, String, usize)> = Vec::new();
-    for branch in stack.branches.values() {
-        if main_branches.contains(&branch.name.as_str()) {
-            continue;
-        }
-        if let Some(parent) = &branch.parent {
-            let depth = branch_depth(&stack, &branch.name);
-            to_rebase.push((branch.name.clone(), parent.clone(), depth));
-        }
-    }
-    to_rebase.sort_by_key(|(_, _, depth)| *depth);
-
-    let mut restacked = Vec::new();
-    for (branch, parent, _) in &to_rebase {
-        utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
-        match git.rebase_onto(branch, parent) {
-            Ok(()) => restacked.push(branch.as_str()),
-            Err(e) => return Err(e),
-        }
-    }
-
-    for branch in &restacked {
-        utils::print_success(&format!("Restacked '{branch}'"));
-    }
-
+    // Re-analyze and restack remaining branches
+    restack_all(git, None).await?;
     utils::print_success("Sync complete");
     Ok(())
 }

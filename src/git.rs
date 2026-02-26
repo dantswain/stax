@@ -177,8 +177,20 @@ impl GitRepo {
             .ok_or_else(|| anyhow!("Cannot determine working directory"))
     }
 
+    /// Rebase `branch` onto `onto`.
+    /// If `old_onto_commit` is provided, uses `--onto` to only replay commits
+    /// after the old parent tip (avoids re-applying parent's commits).
     pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
-        // Skip if branch is already based on onto (merge-base == onto's tip)
+        self.rebase_onto_with_base(branch, onto, None)
+    }
+
+    pub fn rebase_onto_with_base(
+        &self,
+        branch: &str,
+        onto: &str,
+        old_onto_commit: Option<&str>,
+    ) -> Result<()> {
+        // Skip if branch is already based on onto
         let onto_commit = self.get_commit_hash(&format!("refs/heads/{onto}"))?;
         if let Ok(merge_base) = self.get_merge_base(branch, onto) {
             if merge_base.to_string() == onto_commit {
@@ -188,10 +200,20 @@ impl GitRepo {
 
         let workdir = self.workdir()?;
 
-        let output = std::process::Command::new("git")
-            .args(["rebase", onto, branch])
-            .current_dir(workdir)
-            .output()?;
+        let output = match old_onto_commit {
+            Some(old_base) => {
+                // --onto <new_parent> <old_parent_tip> <branch>
+                // Only replays commits that are unique to <branch> (after old_parent_tip)
+                std::process::Command::new("git")
+                    .args(["rebase", "--onto", onto, old_base, branch])
+                    .current_dir(workdir)
+                    .output()?
+            }
+            None => std::process::Command::new("git")
+                .args(["rebase", onto, branch])
+                .current_dir(workdir)
+                .output()?,
+        };
 
         if output.status.success() {
             return Ok(());
