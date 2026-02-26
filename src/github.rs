@@ -152,6 +152,41 @@ impl GitHubClient {
             .await?;
         Ok(())
     }
+
+    /// List comments on a PR (issue comments). Returns vec of (comment_id, body).
+    pub async fn list_pr_comments(&self, pr_number: u64) -> Result<Vec<(u64, String)>> {
+        let page = self
+            .octocrab
+            .issues(&self.owner, &self.repo)
+            .list_comments(pr_number)
+            .per_page(100)
+            .send()
+            .await?;
+
+        Ok(page
+            .items
+            .into_iter()
+            .map(|c| (c.id.into_inner(), c.body.unwrap_or_default()))
+            .collect())
+    }
+
+    /// Create a comment on a PR.
+    pub async fn create_pr_comment(&self, pr_number: u64, body: &str) -> Result<()> {
+        self.octocrab
+            .issues(&self.owner, &self.repo)
+            .create_comment(pr_number, body)
+            .await?;
+        Ok(())
+    }
+
+    /// Update an existing PR comment by comment ID.
+    pub async fn update_pr_comment(&self, comment_id: u64, body: &str) -> Result<()> {
+        self.octocrab
+            .issues(&self.owner, &self.repo)
+            .update_comment(comment_id.into(), body)
+            .await?;
+        Ok(())
+    }
 }
 
 fn parse_github_url(url: &str) -> Result<(String, String)> {

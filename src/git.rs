@@ -256,7 +256,12 @@ fn try_ssh_keys(username: &str) -> Result<Cred, git2::Error> {
         log::debug!("Checking for private key: {}", private_key.display());
 
         if private_key.exists() {
-            if let Ok(cred) = Cred::ssh_key(username, Some(&public_key), &private_key, None) {
+            let pub_key = if public_key.exists() {
+                Some(public_key.as_path())
+            } else {
+                None
+            };
+            if let Ok(cred) = Cred::ssh_key(username, pub_key, &private_key, None) {
                 return Ok(cred);
             }
         }
