@@ -1,4 +1,6 @@
-use crate::{config::Config, git::GitRepo, github::GitHubClient, stack::Stack, token_store, utils};
+use crate::{
+    config::Config, git::GitRepo, github::GitHubClient, stack, stack::Stack, token_store, utils,
+};
 use anyhow::{anyhow, Result};
 
 pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result<()> {
@@ -48,7 +50,12 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
 
     // 5. Analyze stack to find merged/closed PRs
     let stack = Stack::analyze(&git, Some(&github)).await?;
-    let merged = find_merged_branches(&stack, trunk);
+    let mut merged = find_merged_branches(&stack, trunk);
+
+    // Also check branches that are locally merged into trunk but were
+    // filtered out of Stack::analyze (their tip is an ancestor of trunk).
+    let locally_merged = find_locally_merged_branches(&git, &github, &stack, trunk).await;
+    merged.extend(locally_merged);
 
     // 6. Delete merged/closed branches
     if !merged.is_empty() {
@@ -102,6 +109,60 @@ fn find_merged_branches(stack: &Stack, trunk: &str) -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+/// Find branches that are locally merged into trunk but were filtered out of
+/// Stack::analyze(). For each, check GitHub PR state to confirm it was merged/closed.
+async fn find_locally_merged_branches(
+    git: &GitRepo,
+    github: &GitHubClient,
+    analyzed_stack: &Stack,
+    trunk: &str,
+) -> Vec<(String, String)> {
+    let main_branches = ["main", "master", "develop"];
+    let all_branches = match git.get_branches() {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+
+    let candidates: Vec<String> = all_branches
+        .into_iter()
+        .filter(|b| {
+            !main_branches.contains(&b.as_str())
+                && b != trunk
+                && !analyzed_stack.branches.contains_key(b)
+                && stack::is_merged_into(git, b, trunk)
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Fetch PR status in parallel
+    let handles: Vec<_> = candidates
+        .into_iter()
+        .map(|branch| {
+            let gh = github.clone();
+            tokio::spawn(async move {
+                let pr = gh.get_pr_for_branch(&branch).await;
+                (branch, pr)
+            })
+        })
+        .collect();
+
+    let mut result = Vec::new();
+    for handle in handles {
+        if let Ok((branch, Ok(Some(pr)))) = handle.await {
+            match pr.state.as_str() {
+                "merged" => result.push((branch, format!("PR #{} merged", pr.number))),
+                "closed" => result.push((branch, format!("PR #{} closed", pr.number))),
+                _ => {}
+            }
+        }
+    }
+
+    result
 }
 
 /// Prompt the user (unless --force) and delete merged/closed branches.
