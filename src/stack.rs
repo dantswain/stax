@@ -14,7 +14,7 @@ pub struct StackBranch {
     pub is_current: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Stack {
     pub branches: HashMap<String, StackBranch>,
     pub roots: Vec<String>,
