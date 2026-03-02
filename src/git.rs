@@ -203,6 +203,27 @@ impl GitRepo {
         Ok(revwalk.count())
     }
 
+    /// Return the summary (first line) of the first commit on `branch` that is
+    /// not reachable from `base`.  Commits are walked oldest-first so we get the
+    /// first unique commit on the branch.
+    pub fn first_commit_message(&self, base: &str, branch: &str) -> Result<Option<String>> {
+        let base_oid = self.repo.revparse_single(base)?.id();
+        let branch_oid = self.repo.revparse_single(branch)?.id();
+
+        let mut revwalk = self.repo.revwalk()?;
+        revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+        revwalk.push(branch_oid)?;
+        revwalk.hide(base_oid)?;
+
+        if let Some(Ok(oid)) = revwalk.next() {
+            let commit = self.repo.find_commit(oid)?;
+            let summary = commit.summary().unwrap_or("").to_string();
+            Ok(Some(summary))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn workdir(&self) -> Result<&Path> {
         self.repo
             .workdir()
