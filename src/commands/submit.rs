@@ -375,6 +375,15 @@ fn render_subtree(
     }
 }
 
+fn status_icon(pr: &PullRequest) -> &'static str {
+    match pr.state.as_str() {
+        "merged" => "\u{1F7E3}",     // 🟣
+        "closed" => "\u{1F534}",     // 🔴
+        _ if pr.draft => "\u{26AB}", // ⚫
+        _ => "\u{1F7E2}",            // 🟢
+    }
+}
+
 fn format_stack_line(
     branch_name: &str,
     pr: &PullRequest,
@@ -382,14 +391,15 @@ fn format_stack_line(
     is_current: bool,
 ) -> String {
     let indent = "&nbsp;&nbsp;".repeat(depth);
+    let icon = status_icon(pr);
     if is_current {
         format!(
-            "- {indent}**`{branch_name}` [#{}]({}) \u{2190} this PR**",
+            "- {indent}{icon} **`{branch_name}` [#{}]({}) \u{2190} this PR**",
             pr.number, pr.html_url
         )
     } else {
         format!(
-            "- {indent}`{branch_name}` [#{}]({})",
+            "- {indent}{icon} `{branch_name}` [#{}]({})",
             pr.number, pr.html_url
         )
     }
@@ -527,6 +537,79 @@ mod tests {
         assert!(!items.iter().any(|l| l.contains("`main`")));
     }
 
+    // ---- status icons ----
+
+    #[test]
+    fn test_status_icon_open() {
+        let pr = make_pr(1, "A");
+        assert_eq!(status_icon(&pr), "\u{1F7E2}");
+    }
+
+    #[test]
+    fn test_status_icon_draft() {
+        let mut pr = make_pr(1, "A");
+        pr.draft = true;
+        assert_eq!(status_icon(&pr), "\u{26AB}");
+    }
+
+    #[test]
+    fn test_status_icon_merged() {
+        let mut pr = make_pr(1, "A");
+        pr.state = "merged".to_string();
+        assert_eq!(status_icon(&pr), "\u{1F7E3}");
+    }
+
+    #[test]
+    fn test_status_icon_closed() {
+        let mut pr = make_pr(1, "A");
+        pr.state = "closed".to_string();
+        assert_eq!(status_icon(&pr), "\u{1F534}");
+    }
+
+    #[test]
+    fn test_merged_pr_in_comment() {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        let mut pr = make_pr(1, "A");
+        pr.state = "merged".to_string();
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec![], Some(pr)),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "A".to_string(),
+        };
+        let comment = render_stack_comment(&stack, 1);
+        assert!(comment.contains("\u{1F7E3}"));
+    }
+
+    #[test]
+    fn test_draft_pr_in_comment() {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        let mut pr = make_pr(1, "A");
+        pr.draft = true;
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec![], Some(pr)),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "A".to_string(),
+        };
+        let comment = render_stack_comment(&stack, 1);
+        assert!(comment.contains("\u{26AB}"));
+    }
+
     // ---- linear stack ordering (reversed: leaf at top, root at bottom) ----
 
     #[test]
@@ -557,8 +640,8 @@ mod tests {
         let stack = make_linear_stack();
         let comment = render_stack_comment(&stack, 2);
         // A and C should not be bolded
-        assert!(comment.contains("- `C` [#3]"));
-        assert!(comment.contains("- `A` [#1]"));
+        assert!(comment.contains("\u{1F7E2} `C` [#3]"));
+        assert!(comment.contains("\u{1F7E2} `A` [#1]"));
     }
 
     #[test]
@@ -567,11 +650,11 @@ mod tests {
 
         let comment_a = render_stack_comment(&stack, 1);
         assert!(comment_a.contains("**`A` [#1]"));
-        assert!(comment_a.contains("- `B` [#2]"));
+        assert!(comment_a.contains("\u{1F7E2} `B` [#2]"));
 
         let comment_c = render_stack_comment(&stack, 3);
         assert!(comment_c.contains("**`C` [#3]"));
-        assert!(comment_c.contains("- `A` [#1]"));
+        assert!(comment_c.contains("\u{1F7E2} `A` [#1]"));
     }
 
     // ---- single PR ----
@@ -669,9 +752,9 @@ mod tests {
 
         // B and C should be indented (depth 1), A should not (depth 0)
         assert_eq!(items.len(), 3);
-        assert!(items[0].contains("&nbsp;&nbsp;`B`"));
-        assert!(items[1].contains("&nbsp;&nbsp;`C`"));
-        assert!(items[2].starts_with("- **`A`"));
+        assert!(items[0].contains("&nbsp;&nbsp;") && items[0].contains("`B`"));
+        assert!(items[1].contains("&nbsp;&nbsp;") && items[1].contains("`C`"));
+        assert!(!items[2].contains("&nbsp;&nbsp;") && items[2].contains("`A`"));
     }
 
     #[test]
@@ -745,10 +828,11 @@ mod tests {
         // C and D are siblings under B → indented at depth 1
         // B and A are linear → depth 0
         assert_eq!(items.len(), 4);
-        assert!(items[0].contains("&nbsp;&nbsp;`C`"));
-        assert!(items[1].contains("&nbsp;&nbsp;`D`"));
-        assert!(items[2].starts_with("- **`B`")); // no indent, current PR
-        assert!(items[3].starts_with("- `A`")); // no indent
+        assert!(items[0].contains("&nbsp;&nbsp;") && items[0].contains("`C`"));
+        assert!(items[1].contains("&nbsp;&nbsp;") && items[1].contains("`D`"));
+        assert!(!items[2].contains("&nbsp;&nbsp;") && items[2].contains("**`B`")); // no indent, current PR
+        assert!(!items[3].contains("&nbsp;&nbsp;") && items[3].contains("`A`"));
+        // no indent
     }
 
     #[test]
@@ -787,9 +871,9 @@ mod tests {
 
         // B is invisible (no PR) but C and D are still indented because B has 2 children
         assert_eq!(items.len(), 3);
-        assert!(items[0].contains("&nbsp;&nbsp;`C`"));
-        assert!(items[1].contains("&nbsp;&nbsp;`D`"));
-        assert!(items[2].starts_with("- **`A`"));
+        assert!(items[0].contains("&nbsp;&nbsp;") && items[0].contains("`C`"));
+        assert!(items[1].contains("&nbsp;&nbsp;") && items[1].contains("`D`"));
+        assert!(!items[2].contains("&nbsp;&nbsp;") && items[2].contains("**`A`"));
         assert!(!comment.contains("`B`"));
     }
 }
