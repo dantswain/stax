@@ -49,12 +49,60 @@ async fn submit_current_branch(
     config: &Config,
 ) -> Result<()> {
     let current_branch = &stack.current_branch;
+    let main_branches = ["main", "master", "develop"];
 
     // Don't create PRs for main branches
-    if ["main", "master", "develop"].contains(&current_branch.as_str()) {
+    if main_branches.contains(&current_branch.as_str()) {
         return Err(anyhow!(
             "Cannot create PR for main branch '{current_branch}'"
         ));
+    }
+
+    // Collect ancestor branches (parent-first) that don't have PRs yet
+    let mut ancestors_without_prs: Vec<String> = Vec::new();
+    let mut cur = current_branch.as_str();
+    while let Some(branch) = stack.branches.get(cur) {
+        if let Some(parent) = &branch.parent {
+            if !main_branches.contains(&parent.as_str()) {
+                if let Some(parent_branch) = stack.branches.get(parent.as_str()) {
+                    if parent_branch.pull_request.is_none() {
+                        ancestors_without_prs.push(parent.clone());
+                    }
+                }
+            }
+            cur = parent;
+        } else {
+            break;
+        }
+    }
+    ancestors_without_prs.reverse(); // parent-first order
+
+    // If there are parent branches without PRs, ask the user before proceeding
+    let mut stack = stack.clone();
+    if !ancestors_without_prs.is_empty() {
+        utils::print_info("The following parent branches don't have PRs yet:");
+        for name in &ancestors_without_prs {
+            utils::print_info(&format!("  {name}"));
+        }
+
+        let should_submit = Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Submit PRs for these branches first?")
+            .default(true)
+            .interact()?;
+
+        if !should_submit {
+            return Err(anyhow!(
+                "Cannot submit '{}' without PRs for parent branches",
+                current_branch
+            ));
+        }
+
+        for name in &ancestors_without_prs {
+            utils::print_info(&format!("Submitting PR for '{name}'..."));
+            create_new_pr(git, github, name, &stack, config).await?;
+            // Re-analyze after each PR so the next branch sees the updated state
+            stack = Stack::analyze(git, Some(github)).await?;
+        }
     }
 
     let current_stack_branch = stack
@@ -75,7 +123,7 @@ async fn submit_current_branch(
         return Ok(());
     }
 
-    create_new_pr(git, github, current_branch, stack, config).await?;
+    create_new_pr(git, github, current_branch, &stack, config).await?;
 
     // Re-analyze to pick up newly created PR, then update stack comments
     let fresh_stack = Stack::analyze(git, Some(github)).await?;
