@@ -269,7 +269,7 @@ impl Stack {
 
 /// Check if a branch is fully merged into trunk
 /// (its tip is an ancestor of trunk's tip).
-fn is_merged_into(git: &GitRepo, branch: &str, trunk: &str) -> bool {
+pub(crate) fn is_merged_into(git: &GitRepo, branch: &str, trunk: &str) -> bool {
     let branch_hash = git.get_commit_hash(&format!("refs/heads/{branch}")).ok();
     let merge_base = git.get_merge_base(branch, trunk).ok();
     match (branch_hash, merge_base) {
