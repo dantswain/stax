@@ -191,19 +191,25 @@ async fn create_new_pr(
 
     git.ensure_tracking_branch(branch_name)?;
 
-    // Generate title from branch name (convert kebab-case to Title Case)
-    let default_title = branch_name
-        .replace(['-', '_'], " ")
-        .split_whitespace()
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                None => String::new(),
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Default title: first commit message on this branch, falling back to branch name
+    let default_title = branch
+        .parent
+        .as_ref()
+        .and_then(|parent| git.first_commit_message(parent, branch_name).ok().flatten())
+        .unwrap_or_else(|| {
+            branch_name
+                .replace(['-', '_'], " ")
+                .split_whitespace()
+                .map(|word| {
+                    let mut chars = word.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
 
     // Get PR title from user
     let title: String = Input::with_theme(&ColorfulTheme::default())
