@@ -2,6 +2,7 @@ use crate::{
     config::Config, git::GitRepo, github::GitHubClient, stack, stack::Stack, token_store, utils,
 };
 use anyhow::{anyhow, Result};
+use std::collections::HashSet;
 
 pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result<()> {
     let git = GitRepo::open(".")?;
@@ -48,13 +49,19 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
         .ok_or_else(|| anyhow!("No 'origin' remote found."))?;
     let github = GitHubClient::new(&token, &remote_url)?;
 
-    // 5. Analyze stack to find merged/closed PRs
+    // 5. Analyze stack to find merged/closed PRs (scoped to the current stack)
     let stack = Stack::analyze(&git, Some(&github)).await?;
-    let mut merged = find_merged_branches(&stack, trunk);
+    let current_stack: HashSet<String> = stack
+        .get_stack_for_branch(&original_branch)
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+    let mut merged = find_merged_branches(&stack, trunk, &current_stack);
 
-    // Also check branches that are locally merged into trunk but were
-    // filtered out of Stack::analyze (their tip is an ancestor of trunk).
-    let locally_merged = find_locally_merged_branches(&git, &github, &stack, trunk).await;
+    // Also check if the current branch is locally merged into trunk but was
+    // filtered out of Stack::analyze (its tip is an ancestor of trunk).
+    let locally_merged =
+        find_locally_merged_branch(&git, &github, &stack, trunk, &original_branch).await;
     merged.extend(locally_merged);
 
     // 6. Delete merged/closed branches
@@ -87,8 +94,12 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
     Ok(())
 }
 
-/// Find branches whose PRs are merged or closed.
-fn find_merged_branches(stack: &Stack, trunk: &str) -> Vec<(String, String)> {
+/// Find branches whose PRs are merged or closed, scoped to the current stack.
+fn find_merged_branches(
+    stack: &Stack,
+    trunk: &str,
+    current_stack: &HashSet<String>,
+) -> Vec<(String, String)> {
     let main_branches = ["main", "master", "develop"];
 
     stack
@@ -96,6 +107,9 @@ fn find_merged_branches(stack: &Stack, trunk: &str) -> Vec<(String, String)> {
         .values()
         .filter_map(|branch| {
             if main_branches.contains(&branch.name.as_str()) || branch.name == trunk {
+                return None;
+            }
+            if !current_stack.contains(&branch.name) {
                 return None;
             }
             if let Some(pr) = &branch.pull_request {
@@ -111,58 +125,49 @@ fn find_merged_branches(stack: &Stack, trunk: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Find branches that are locally merged into trunk but were filtered out of
-/// Stack::analyze(). For each, check GitHub PR state to confirm it was merged/closed.
-async fn find_locally_merged_branches(
+/// Check if the current branch is locally merged into trunk but was filtered
+/// out of Stack::analyze(). If so, verify via GitHub that its PR is merged/closed.
+async fn find_locally_merged_branch(
     git: &GitRepo,
     github: &GitHubClient,
     analyzed_stack: &Stack,
     trunk: &str,
+    current_branch: &str,
 ) -> Vec<(String, String)> {
-    let main_branches = ["main", "master", "develop"];
-    let all_branches = match git.get_branches() {
-        Ok(b) => b,
-        Err(_) => return Vec::new(),
-    };
-
-    let candidates: Vec<String> = all_branches
-        .into_iter()
-        .filter(|b| {
-            !main_branches.contains(&b.as_str())
-                && b != trunk
-                && !analyzed_stack.branches.contains_key(b)
-                && stack::is_merged_into(git, b, trunk)
-        })
-        .collect();
-
-    if candidates.is_empty() {
+    // If the branch is already in the stack, find_merged_branches handles it
+    if analyzed_stack.branches.contains_key(current_branch) {
         return Vec::new();
     }
 
-    // Fetch PR status in parallel
-    let handles: Vec<_> = candidates
-        .into_iter()
-        .map(|branch| {
-            let gh = github.clone();
-            tokio::spawn(async move {
-                let pr = gh.get_pr_for_branch(&branch).await;
-                (branch, pr)
-            })
-        })
-        .collect();
+    let main_branches = ["main", "master", "develop"];
+    if main_branches.contains(&current_branch) || current_branch == trunk {
+        return Vec::new();
+    }
 
-    let mut result = Vec::new();
-    for handle in handles {
-        if let Ok((branch, Ok(Some(pr)))) = handle.await {
-            match pr.state.as_str() {
-                "merged" => result.push((branch, format!("PR #{} merged", pr.number))),
-                "closed" => result.push((branch, format!("PR #{} closed", pr.number))),
-                _ => {}
+    if !stack::is_merged_into(git, current_branch, trunk) {
+        return Vec::new();
+    }
+
+    // Fetch PR status from GitHub
+    if let Ok(Some(pr)) = github.get_pr_for_branch(current_branch).await {
+        match pr.state.as_str() {
+            "merged" => {
+                return vec![(
+                    current_branch.to_string(),
+                    format!("PR #{} merged", pr.number),
+                )]
             }
+            "closed" => {
+                return vec![(
+                    current_branch.to_string(),
+                    format!("PR #{} closed", pr.number),
+                )]
+            }
+            _ => {}
         }
     }
 
-    result
+    Vec::new()
 }
 
 /// Prompt the user (unless --force) and delete merged/closed branches.
@@ -211,21 +216,43 @@ async fn restack_branches(
     git: &GitRepo,
     _config: &Config,
     github: &GitHubClient,
-    _original_branch: &str,
+    original_branch: &str,
 ) -> Result<()> {
-    restack_all(git, Some(github)).await
+    restack_all(git, Some(github), original_branch).await
 }
 
 /// Shared restack logic used by both normal sync and --continue.
-async fn restack_all(git: &GitRepo, github: Option<&GitHubClient>) -> Result<()> {
+/// Only restacks branches in the same stack as `current_branch`.
+async fn restack_all(
+    git: &GitRepo,
+    github: Option<&GitHubClient>,
+    current_branch: &str,
+) -> Result<()> {
     let stack = Stack::analyze(git, github).await?;
     let main_branches = ["main", "master", "develop"];
+
+    // Scope to only the current branch and its descendants (not ancestors).
+    // Rebasing ancestor branches is their own concern.
+    let mut restack_scope: HashSet<String> = HashSet::new();
+    let mut queue = vec![current_branch.to_string()];
+    while let Some(name) = queue.pop() {
+        if restack_scope.insert(name.clone()) {
+            if let Some(branch) = stack.branches.get(&name) {
+                for child in &branch.children {
+                    queue.push(child.clone());
+                }
+            }
+        }
+    }
 
     // Collect branches with their parents and depth for topological ordering.
     let mut to_rebase: Vec<(String, String, usize)> = Vec::new();
 
     for branch in stack.branches.values() {
         if main_branches.contains(&branch.name.as_str()) {
+            continue;
+        }
+        if !restack_scope.contains(&branch.name) {
             continue;
         }
         if let Some(parent) = &branch.parent {
@@ -284,8 +311,9 @@ async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()>
         utils::print_success("Rebase continued successfully");
     }
 
-    // Re-analyze and restack remaining branches
-    restack_all(git, None).await?;
+    // Re-analyze and restack remaining branches (scoped to current stack)
+    let current_branch = git.current_branch()?;
+    restack_all(git, None, &current_branch).await?;
     utils::print_success("Sync complete");
     Ok(())
 }
