@@ -295,7 +295,7 @@ impl GitRepo {
     pub fn fetch(&self) -> Result<()> {
         let workdir = self.workdir()?;
         let output = std::process::Command::new("git")
-            .args(["fetch", "origin"])
+            .args(["fetch", "--prune", "origin"])
             .current_dir(workdir)
             .output()?;
 
@@ -383,11 +383,15 @@ impl GitRepo {
 
             if !output.status.success() {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow!(
-                    "Failed to delete remote branch '{}': {}",
-                    branch_name,
-                    stderr.trim()
-                ));
+                // If the remote branch was already deleted (e.g., GitHub auto-deletes
+                // on merge), treat it as success rather than an error.
+                if !stderr.contains("remote ref does not exist") {
+                    return Err(anyhow!(
+                        "Failed to delete remote branch '{}': {}",
+                        branch_name,
+                        stderr.trim()
+                    ));
+                }
             }
         }
 
