@@ -1,5 +1,7 @@
 # Stax
 
+[![CI](https://github.com/dantswain/stax/actions/workflows/ci.yml/badge.svg)](https://github.com/dantswain/stax/actions/workflows/ci.yml)
+
 A fast CLI tool for managing stacked pull requests on GitHub.
 
 ## Overview
