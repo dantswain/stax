@@ -364,24 +364,68 @@ impl Stack {
 
         let commits = build_commit_cache(git, &all_branches)?;
 
-        // Compute merged set using the commit cache
+        // Compute merged set using the commit cache — parallelized across threads
         let trunk = all_branches.iter().find(|b| is_main_branch(b)).cloned();
         let merged: HashSet<String> = if let Some(ref trunk_name) = trunk {
-            all_branches
+            let candidates: Vec<&String> = all_branches
                 .iter()
-                .filter(|b| {
-                    if is_main_branch(b) {
-                        return false;
-                    }
-                    let Some(bh) = commits.get(*b) else {
-                        return false;
-                    };
-                    git.get_merge_base(b, trunk_name)
-                        .map(|mb| *bh == mb.to_string())
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect()
+                .filter(|b| !is_main_branch(b) && commits.contains_key(*b))
+                .collect();
+
+            if candidates.is_empty() {
+                HashSet::new()
+            } else {
+                let num_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+                    .min(candidates.len());
+
+                if num_threads <= 1 {
+                    candidates
+                        .iter()
+                        .filter(|b| {
+                            let bh = &commits[**b];
+                            git.get_merge_base(b, trunk_name)
+                                .map(|mb| *bh == mb.to_string())
+                                .unwrap_or(false)
+                        })
+                        .map(|b| (*b).clone())
+                        .collect()
+                } else {
+                    let repo_path = git.repo_workdir()?;
+                    let chunk_size = candidates.len().div_ceil(num_threads);
+
+                    let results: Vec<Vec<String>> = std::thread::scope(|s| {
+                        let handles: Vec<_> = candidates
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                s.spawn(|| {
+                                    let git = GitRepo::open(&repo_path).ok()?;
+                                    Some(
+                                        chunk
+                                            .iter()
+                                            .filter(|b| {
+                                                let bh = &commits[**b];
+                                                git.get_merge_base(b, trunk_name)
+                                                    .map(|mb| *bh == mb.to_string())
+                                                    .unwrap_or(false)
+                                            })
+                                            .map(|b| (*b).clone())
+                                            .collect::<Vec<_>>(),
+                                    )
+                                })
+                            })
+                            .collect();
+
+                        handles
+                            .into_iter()
+                            .filter_map(|h| h.join().expect("thread panicked"))
+                            .collect()
+                    });
+
+                    results.into_iter().flatten().collect()
+                }
+            }
         } else {
             HashSet::new()
         };
