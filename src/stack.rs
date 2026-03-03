@@ -1,3 +1,4 @@
+use crate::commands::navigate::{build_commit_cache, find_children, find_parent, is_main_branch};
 use crate::git::GitRepo;
 use crate::github::{GitHubClient, PullRequest};
 use anyhow::Result;
@@ -134,6 +135,170 @@ impl Stack {
             roots.len(),
             prs.len()
         );
+
+        Ok(Stack {
+            branches: stack_branches,
+            roots,
+            current_branch,
+        })
+    }
+
+    /// Targeted analysis that only discovers the current branch's lineage.
+    /// Walks the parent chain up to root, then finds children at each level.
+    /// O(n × depth) merge-base calls instead of O(n²).
+    pub async fn analyze_for_branch(
+        git: &GitRepo,
+        branch: &str,
+        github: Option<&GitHubClient>,
+    ) -> Result<Self> {
+        let all_branches = git.get_branches()?;
+        let current_branch = git.current_branch()?;
+
+        let commits = build_commit_cache(git, &all_branches)?;
+
+        // Compute merged set using the commit cache
+        let trunk = all_branches.iter().find(|b| is_main_branch(b)).cloned();
+        let merged: HashSet<String> = if let Some(ref trunk_name) = trunk {
+            all_branches
+                .iter()
+                .filter(|b| {
+                    if is_main_branch(b) {
+                        return false;
+                    }
+                    let Some(bh) = commits.get(*b) else {
+                        return false;
+                    };
+                    git.get_merge_base(b, trunk_name)
+                        .map(|mb| *bh == mb.to_string())
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
+        // Walk parent chain from the target branch up to the root
+        let mut lineage = vec![branch.to_string()];
+        let mut current = branch.to_string();
+        while !is_main_branch(&current) {
+            match find_parent(git, &current, &all_branches, &commits, &merged)? {
+                Some(parent) => {
+                    lineage.push(parent.clone());
+                    current = parent;
+                }
+                None => break,
+            }
+        }
+
+        // For each branch in the lineage, discover children (siblings + descendants)
+        let mut discovered: HashSet<String> = lineage.iter().cloned().collect();
+        let mut queue: Vec<String> = lineage.clone();
+        while let Some(b) = queue.pop() {
+            let children = find_children(git, &b, &all_branches, &commits, &merged)?;
+            for child in children {
+                if discovered.insert(child.clone()) {
+                    queue.push(child);
+                }
+            }
+        }
+
+        // Build relationships only for discovered branches
+        let discovered_branches: Vec<String> = all_branches
+            .iter()
+            .filter(|b| discovered.contains(*b))
+            .cloned()
+            .collect();
+
+        // Compute parent for each discovered non-main, non-merged branch
+        let mut relationships = Vec::new();
+        for b in &discovered_branches {
+            if is_main_branch(b) || merged.contains(b) {
+                continue;
+            }
+            if let Some(parent) = find_parent(git, b, &all_branches, &commits, &merged)? {
+                relationships.push((b.clone(), parent));
+            }
+        }
+
+        // Fetch PRs concurrently
+        let bulk_handle = if let Some(gh) = github {
+            let gh = gh.clone();
+            Some(tokio::spawn(
+                async move { gh.get_open_pull_requests().await },
+            ))
+        } else {
+            None
+        };
+
+        let mut prs: HashMap<String, PullRequest> = HashMap::new();
+        if let Some(handle) = bulk_handle {
+            for pr in handle.await?? {
+                if discovered.contains(&pr.head_ref) {
+                    prs.insert(pr.head_ref.clone(), pr);
+                }
+            }
+        }
+
+        // Fetch individual PRs for branches still missing
+        if let Some(gh) = github {
+            let missing: Vec<_> = discovered_branches
+                .iter()
+                .filter(|b| !is_main_branch(b) && !prs.contains_key(*b))
+                .cloned()
+                .collect();
+
+            if !missing.is_empty() {
+                let handles: Vec<_> = missing
+                    .into_iter()
+                    .map(|b| {
+                        let gh = gh.clone();
+                        tokio::spawn(async move { gh.get_pr_for_branch(&b).await })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    if let Ok(Some(pr)) = handle.await? {
+                        prs.insert(pr.head_ref.clone(), pr);
+                    }
+                }
+            }
+        }
+
+        // Build StackBranch entries
+        let mut stack_branches = HashMap::new();
+        for b in &discovered_branches {
+            let commit_hash = commits.get(b).cloned().unwrap_or_default();
+            let pull_request = prs.get(b).cloned();
+            let is_current = *b == current_branch;
+
+            stack_branches.insert(
+                b.clone(),
+                StackBranch {
+                    name: b.clone(),
+                    parent: None,
+                    children: Vec::new(),
+                    commit_hash,
+                    pull_request,
+                    is_current,
+                },
+            );
+        }
+
+        for (child, parent) in relationships {
+            if let Some(child_branch) = stack_branches.get_mut(&child) {
+                child_branch.parent = Some(parent.clone());
+            }
+            if let Some(parent_branch) = stack_branches.get_mut(&parent) {
+                parent_branch.children.push(child);
+            }
+        }
+
+        let roots = stack_branches
+            .values()
+            .filter(|b| b.parent.is_none())
+            .map(|b| b.name.clone())
+            .collect();
 
         Ok(Stack {
             branches: stack_branches,

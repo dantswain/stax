@@ -20,7 +20,8 @@ pub async fn run() -> Result<()> {
         None
     };
 
-    let stack = Stack::analyze(&git, github_client.as_ref()).await?;
+    let current_branch = git.current_branch()?;
+    let stack = Stack::analyze_for_branch(&git, &current_branch, github_client.as_ref()).await?;
 
     // Scope to only the current branch's stack (ancestors + descendants)
     let in_scope: HashSet<String> = stack

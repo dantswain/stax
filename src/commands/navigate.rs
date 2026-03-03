@@ -1,6 +1,5 @@
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
-use crate::stack::is_merged_into;
 use crate::{token_store, utils};
 use anyhow::{anyhow, Result};
 use colored::*;
@@ -542,7 +541,17 @@ pub fn get_branches_with_cache(
     let trunk = all.iter().find(|b| is_main_branch(b)).cloned();
     let merged = if let Some(ref trunk) = trunk {
         all.iter()
-            .filter(|b| !is_main_branch(b) && is_merged_into(git, b, trunk))
+            .filter(|b| {
+                if is_main_branch(b) {
+                    return false;
+                }
+                let Some(bh) = commits.get(*b) else {
+                    return false;
+                };
+                git.get_merge_base(b, trunk)
+                    .map(|mb| *bh == mb.to_string())
+                    .unwrap_or(false)
+            })
             .cloned()
             .collect()
     } else {
