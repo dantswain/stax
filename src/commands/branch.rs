@@ -25,6 +25,11 @@ pub async fn run(name: Option<&str>) -> Result<()> {
     };
 
     let current_branch = git.current_branch()?;
+    log::debug!(
+        "create: branch='{}', parent='{}'",
+        branch_name,
+        current_branch
+    );
 
     git.create_branch(&branch_name, Some(&format!("refs/heads/{current_branch}")))?;
     git.checkout_branch(&branch_name)?;

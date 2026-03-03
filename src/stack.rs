@@ -25,6 +25,11 @@ impl Stack {
     pub async fn analyze(git: &GitRepo, github: Option<&GitHubClient>) -> Result<Self> {
         let all_branches = git.get_branches()?;
         let current_branch = git.current_branch()?;
+        log::debug!(
+            "Analyzing stack: {} branches, current='{}'",
+            all_branches.len(),
+            current_branch
+        );
 
         let main_branches = ["main", "master", "develop"];
 
@@ -108,6 +113,7 @@ impl Stack {
         }
 
         for (child, parent) in relationships {
+            log::debug!("Relationship: '{}' -> parent '{}'", child, parent);
             if let Some(child_branch) = stack_branches.get_mut(&child) {
                 child_branch.parent = Some(parent.clone());
             }
@@ -116,11 +122,18 @@ impl Stack {
             }
         }
 
-        let roots = stack_branches
+        let roots: Vec<_> = stack_branches
             .values()
             .filter(|b| b.parent.is_none())
             .map(|b| b.name.clone())
             .collect();
+
+        log::debug!(
+            "Stack analysis complete: {} branches, {} roots, {} PRs found",
+            stack_branches.len(),
+            roots.len(),
+            prs.len()
+        );
 
         Ok(Stack {
             branches: stack_branches,

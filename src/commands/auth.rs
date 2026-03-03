@@ -22,6 +22,7 @@ pub async fn run(command: Option<AuthCommands>) -> Result<()> {
 }
 
 async fn login() -> Result<()> {
+    log::debug!("auth: starting login flow");
     utils::print_info("Authenticating with GitHub...");
 
     let auth_methods = vec![
@@ -37,6 +38,7 @@ async fn login() -> Result<()> {
 
     let github_token = match auth_choice {
         0 => {
+            log::debug!("auth: user chose browser authentication");
             utils::print_info("Starting browser authentication...");
             match GitHubClient::authenticate_with_oauth().await {
                 Ok(token) => token,
@@ -57,6 +59,7 @@ async fn login() -> Result<()> {
             }
         }
         1 => {
+            log::debug!("auth: user chose manual token entry");
             let token = Input::<String>::new()
                 .with_prompt("GitHub personal access token")
                 .interact_text()?;

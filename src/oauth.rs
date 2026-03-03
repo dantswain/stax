@@ -60,6 +60,7 @@ impl OAuthClient {
     }
 
     pub async fn authenticate(&self) -> Result<String> {
+        log::debug!("Starting OAuth device flow authentication");
         // Step 1: Get device code
         crate::utils::print_info("Requesting device authorization from GitHub...");
         let device_response = self.request_device_code().await?;
@@ -78,10 +79,16 @@ impl OAuthClient {
         }
 
         // Step 3: Poll for access token
+        log::debug!(
+            "Polling for access token (interval={}s, expires_in={}s)",
+            device_response.interval,
+            device_response.expires_in
+        );
         crate::utils::print_info("Waiting for authorization...");
         let token = self.poll_for_token(&device_response).await?;
 
         // Step 4: Verify token works
+        log::debug!("Token received, verifying with GitHub API");
         let user = self.get_user_info(&token).await?;
         crate::utils::print_success(&format!("Successfully authenticated as {}", user.login));
 

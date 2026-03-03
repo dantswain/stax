@@ -5,6 +5,7 @@ use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
 pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
+    log::debug!("restack: all={}, continue={}", all, continue_rebase);
     let git = GitRepo::open(".")?;
 
     if continue_rebase {
@@ -86,6 +87,7 @@ pub async fn run(all: bool, continue_rebase: bool) -> Result<()> {
 
     let mut restacked = Vec::new();
 
+    log::debug!("restack: {} branches to rebase", branches_to_rebase.len());
     for (branch, parent) in &branches_to_rebase {
         utils::print_info(&format!("Rebasing '{}' onto '{}'", branch, parent));
         let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());

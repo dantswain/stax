@@ -5,10 +5,17 @@ use anyhow::{anyhow, Result};
 use std::collections::HashSet;
 
 pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result<()> {
+    log::debug!(
+        "sync: no_restack={}, force={}, continue={}",
+        no_restack,
+        force,
+        continue_rebase
+    );
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
 
     if continue_rebase {
+        log::debug!("sync: continuing after conflicts");
         return continue_after_conflicts(&git, &config).await;
     }
 
@@ -63,6 +70,7 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
     let locally_merged =
         find_locally_merged_branch(&git, &github, &stack, trunk, &original_branch).await;
     merged.extend(locally_merged);
+    log::debug!("sync: found {} merged/closed branches", merged.len());
 
     // 6. Delete merged/closed branches
     if !merged.is_empty() {
@@ -73,7 +81,10 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
 
     // 7. Restack
     if !no_restack {
+        log::debug!("sync: restacking branches");
         restack_branches(&git, &config, &github, &original_branch).await?;
+    } else {
+        log::debug!("sync: skipping restack (--no-restack)");
     }
 
     // 8. Restore original branch (or trunk if it was deleted)

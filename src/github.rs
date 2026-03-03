@@ -29,6 +29,7 @@ impl GitHubClient {
             .build()?;
 
         let (owner, repo) = parse_github_url(repo_url)?;
+        log::debug!("GitHub client initialized for {}/{}", owner, repo);
 
         Ok(GitHubClient {
             octocrab,
@@ -49,6 +50,7 @@ impl GitHubClient {
 
     /// Fetch the first page of open PRs (up to 100). Sufficient for most repos.
     pub async fn get_open_pull_requests(&self) -> Result<Vec<PullRequest>> {
+        log::debug!("Fetching open PRs for {}/{}", self.owner, self.repo);
         let page = self
             .octocrab
             .pulls(&self.owner, &self.repo)
@@ -80,6 +82,7 @@ impl GitHubClient {
     /// Fetch the most recent PR for a specific branch using the API's `head` filter.
     /// Prefers open PRs over closed/merged ones.
     pub async fn get_pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>> {
+        log::debug!("Fetching PR for branch '{}'", branch);
         let page = self
             .octocrab
             .pulls(&self.owner, &self.repo)
@@ -127,6 +130,13 @@ impl GitHubClient {
         base: &str,
         draft: bool,
     ) -> Result<PullRequest> {
+        log::debug!(
+            "Creating PR: '{}' ({} -> {}, draft={})",
+            title,
+            head,
+            base,
+            draft
+        );
         let pr = self
             .octocrab
             .pulls(&self.owner, &self.repo)
@@ -156,6 +166,7 @@ impl GitHubClient {
         body: Option<&str>,
         base: Option<&str>,
     ) -> Result<PullRequest> {
+        log::debug!("Updating PR #{}", number);
         let pulls = self.octocrab.pulls(&self.owner, &self.repo);
         let mut update = pulls.update(number);
 
