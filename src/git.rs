@@ -274,6 +274,12 @@ impl GitRepo {
             .ok_or_else(|| anyhow!("Cannot determine working directory"))
     }
 
+    /// Return an owned path suitable for opening new `GitRepo` handles
+    /// (e.g. in spawned threads for parallel git operations).
+    pub fn repo_workdir(&self) -> Result<std::path::PathBuf> {
+        Ok(self.workdir()?.to_path_buf())
+    }
+
     /// Rebase `branch` onto `onto`.
     /// If `old_onto_commit` is provided, uses `--onto` to only replay commits
     /// after the old parent tip (avoids re-applying parent's commits).
