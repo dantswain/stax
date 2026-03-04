@@ -1,6 +1,7 @@
 mod common;
 
 use common::{create_branch_with_commit, create_test_repo, git};
+use std::collections::HashSet;
 
 // ── Stack::analyze (without GitHub) ──────────────────────────────────────────
 
@@ -217,4 +218,79 @@ async fn test_orphan_branch_falls_back_to_main() {
         Some("main"),
         "branch with no closer parent should fall back to main"
     );
+}
+
+// ── from_parent_map matches analyze_for_branch ──────────────────────────────
+
+#[tokio::test]
+async fn test_from_parent_map_matches_analyze_for_branch() {
+    let (dir, _repo) = create_test_repo();
+    let p = dir.path();
+
+    // Build a non-trivial topology: main → A → B → C, main → D
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+    create_branch_with_commit(p, "D", "main");
+    git(p, &["checkout", "B"]); // current branch = B
+
+    // Reopen repo after checkout
+    let repo = stax::git::GitRepo::open(p).unwrap();
+
+    // Get the reference result from analyze_for_branch
+    let expected = stax::stack::Stack::analyze_for_branch(&repo, "B", None)
+        .await
+        .unwrap();
+
+    // Build the same via the cache path
+    let (branches, commits, merged, parent_map) =
+        stax::commands::navigate::get_branches_and_parent_map(&repo).unwrap();
+    let actual = stax::stack::Stack::from_parent_map(
+        &repo,
+        "B",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    // Compare: same current branch
+    assert_eq!(actual.current_branch, expected.current_branch);
+
+    // Compare: same set of branch names discovered
+    let actual_names: HashSet<&String> = actual.branches.keys().collect();
+    let expected_names: HashSet<&String> = expected.branches.keys().collect();
+    assert_eq!(actual_names, expected_names, "discovered branches differ");
+
+    // Compare: same parent for each branch
+    for (name, actual_branch) in &actual.branches {
+        let expected_branch = expected.branches.get(name).unwrap();
+        assert_eq!(
+            actual_branch.parent, expected_branch.parent,
+            "parent mismatch for branch '{name}'"
+        );
+    }
+
+    // Compare: same children for each branch (sorted for determinism)
+    for (name, actual_branch) in &actual.branches {
+        let expected_branch = expected.branches.get(name).unwrap();
+        let mut actual_children = actual_branch.children.clone();
+        let mut expected_children = expected_branch.children.clone();
+        actual_children.sort();
+        expected_children.sort();
+        assert_eq!(
+            actual_children, expected_children,
+            "children mismatch for branch '{name}'"
+        );
+    }
+
+    // Compare: same roots (sorted)
+    let mut actual_roots = actual.roots.clone();
+    let mut expected_roots = expected.roots.clone();
+    actual_roots.sort();
+    expected_roots.sort();
+    assert_eq!(actual_roots, expected_roots, "roots differ");
 }

@@ -1,4 +1,6 @@
-use crate::commands::navigate::{build_commit_cache, find_children, find_parent, is_main_branch};
+use crate::commands::navigate::{
+    build_commit_cache, children_from_map, find_children, find_parent, is_main_branch,
+};
 use crate::git::GitRepo;
 use crate::github::{GitHubClient, PullRequest};
 use anyhow::Result;
@@ -474,6 +476,148 @@ impl Stack {
         }
 
         // Fetch PRs concurrently
+        let bulk_handle = if let Some(gh) = github {
+            let gh = gh.clone();
+            Some(tokio::spawn(
+                async move { gh.get_open_pull_requests().await },
+            ))
+        } else {
+            None
+        };
+
+        let mut prs: HashMap<String, PullRequest> = HashMap::new();
+        if let Some(handle) = bulk_handle {
+            for pr in handle.await?? {
+                if discovered.contains(&pr.head_ref) {
+                    prs.insert(pr.head_ref.clone(), pr);
+                }
+            }
+        }
+
+        // Fetch individual PRs for branches still missing
+        if let Some(gh) = github {
+            let missing: Vec<_> = discovered_branches
+                .iter()
+                .filter(|b| !is_main_branch(b) && !prs.contains_key(*b))
+                .cloned()
+                .collect();
+
+            if !missing.is_empty() {
+                let handles: Vec<_> = missing
+                    .into_iter()
+                    .map(|b| {
+                        let gh = gh.clone();
+                        tokio::spawn(async move { gh.get_pr_for_branch(&b).await })
+                    })
+                    .collect();
+
+                for handle in handles {
+                    if let Ok(Some(pr)) = handle.await? {
+                        prs.insert(pr.head_ref.clone(), pr);
+                    }
+                }
+            }
+        }
+
+        // Build StackBranch entries
+        let mut stack_branches = HashMap::new();
+        for b in &discovered_branches {
+            let commit_hash = commits.get(b).cloned().unwrap_or_default();
+            let pull_request = prs.get(b).cloned();
+            let is_current = *b == current_branch;
+
+            stack_branches.insert(
+                b.clone(),
+                StackBranch {
+                    name: b.clone(),
+                    parent: None,
+                    children: Vec::new(),
+                    commit_hash,
+                    pull_request,
+                    is_current,
+                },
+            );
+        }
+
+        for (child, parent) in relationships {
+            if let Some(child_branch) = stack_branches.get_mut(&child) {
+                child_branch.parent = Some(parent.clone());
+            }
+            if let Some(parent_branch) = stack_branches.get_mut(&parent) {
+                parent_branch.children.push(child);
+            }
+        }
+
+        let roots = stack_branches
+            .values()
+            .filter(|b| b.parent.is_none())
+            .map(|b| b.name.clone())
+            .collect();
+
+        Ok(Stack {
+            branches: stack_branches,
+            roots,
+            current_branch,
+        })
+    }
+
+    /// Build a Stack using a pre-computed parent map from the cache.
+    /// Replaces the O(n × depth) merge-base calls in `analyze_for_branch()` with
+    /// zero-cost HashMap lookups.  PR fetching is identical.
+    pub async fn from_parent_map(
+        git: &GitRepo,
+        branch: &str,
+        github: Option<&GitHubClient>,
+        all_branches: &[String],
+        commits: &HashMap<String, String>,
+        merged: &HashSet<String>,
+        parent_map: &HashMap<String, Option<String>>,
+    ) -> Result<Self> {
+        let current_branch = git.current_branch()?;
+
+        // Walk parent chain using cached parent_map (zero git calls)
+        let mut lineage = vec![branch.to_string()];
+        let mut current = branch.to_string();
+        while !is_main_branch(&current) {
+            match parent_map.get(&current).and_then(|p| p.as_ref()) {
+                Some(parent) => {
+                    lineage.push(parent.clone());
+                    current = parent.clone();
+                }
+                None => break,
+            }
+        }
+
+        // BFS to discover children at each level (zero git calls)
+        let mut discovered: HashSet<String> = lineage.iter().cloned().collect();
+        let mut queue: Vec<String> = lineage.clone();
+        while let Some(b) = queue.pop() {
+            for child in children_from_map(&b, parent_map, merged) {
+                if discovered.insert(child.clone()) {
+                    queue.push(child);
+                }
+            }
+        }
+
+        // Filter to discovered branches only
+        let discovered_branches: Vec<String> = all_branches
+            .iter()
+            .filter(|b| discovered.contains(*b))
+            .cloned()
+            .collect();
+
+        // Build relationships from cached parent_map (zero git calls)
+        let mut relationships = Vec::new();
+        for b in &discovered_branches {
+            if is_main_branch(b) || merged.contains(b) {
+                continue;
+            }
+            if let Some(Some(parent)) = parent_map.get(b) {
+                relationships.push((b.clone(), parent.clone()));
+            }
+        }
+
+        // Fetch PRs concurrently — same pattern as analyze_for_branch
         let bulk_handle = if let Some(gh) = github {
             let gh = gh.clone();
             Some(tokio::spawn(

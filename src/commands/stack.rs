@@ -1,3 +1,4 @@
+use crate::commands::navigate::get_branches_and_parent_map;
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
 use crate::stack::Stack;
@@ -21,7 +22,17 @@ pub async fn run() -> Result<()> {
     };
 
     let current_branch = git.current_branch()?;
-    let stack = Stack::analyze_for_branch(&git, &current_branch, github_client.as_ref()).await?;
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
+    let stack = Stack::from_parent_map(
+        &git,
+        &current_branch,
+        github_client.as_ref(),
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await?;
 
     // Scope to only the current branch's stack (ancestors + descendants)
     let in_scope: HashSet<String> = stack
