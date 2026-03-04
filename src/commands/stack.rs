@@ -7,6 +7,7 @@ use colored::*;
 use std::collections::HashSet;
 
 pub async fn run() -> Result<()> {
+    log::debug!("stack: visualizing stack");
     let git = GitRepo::open(".")?;
 
     let github_client = if let Some(token) = token_store::get_token() {

@@ -555,6 +555,7 @@ pub fn get_branches_with_cache(
 pub async fn down() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
+    log::debug!("navigate down: current='{}'", current);
 
     if is_main_branch(&current) {
         return Err(anyhow!("Already at the bottom of the stack"));
@@ -563,6 +564,7 @@ pub async fn down() -> Result<()> {
     let (branches, commits, merged) = get_branches_with_cache(&git)?;
     let parent = find_parent(&git, &current, &branches, &commits, &merged)?
         .ok_or_else(|| anyhow!("Already at the bottom of the stack"))?;
+    log::debug!("navigate down: target='{}'", parent);
 
     git.checkout_branch(&parent)?;
     utils::print_success(&format!("Moved down to {}", parent));
@@ -572,6 +574,7 @@ pub async fn down() -> Result<()> {
 pub async fn up() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
+    log::debug!("navigate up: current='{}'", current);
     let (branches, commits, merged) = get_branches_with_cache(&git)?;
     let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
 
@@ -599,6 +602,7 @@ pub async fn up() -> Result<()> {
         )?,
     };
 
+    log::debug!("navigate up: target='{}'", target);
     git.checkout_branch(&target)?;
     utils::print_success(&format!("Moved up to {}", target));
     Ok(())
@@ -607,6 +611,7 @@ pub async fn up() -> Result<()> {
 pub async fn bottom() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
+    log::debug!("navigate bottom: current='{}'", current);
     let (branches, commits, merged) = get_branches_with_cache(&git)?;
     let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
 
@@ -704,6 +709,7 @@ pub fn is_active_stack(
 pub async fn top() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
+    log::debug!("navigate top: current='{}'", current);
     let (branches, commits, merged) = get_branches_with_cache(&git)?;
     let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
 

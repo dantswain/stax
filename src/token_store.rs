@@ -31,6 +31,7 @@ impl TokenStore {
     /// Store a GitHub token securely
     pub fn store_token(token: &str) -> Result<()> {
         let token_path = Self::get_token_path()?;
+        log::debug!("Storing token to {}", token_path.display());
 
         // Write token to file
         fs::write(&token_path, token)?;
@@ -61,10 +62,12 @@ impl TokenStore {
         let token_path = Self::get_token_path().ok()?;
 
         if token_path.exists() {
+            log::debug!("Token found at {}", token_path.display());
             fs::read_to_string(token_path)
                 .ok()
                 .map(|s| s.trim().to_string())
         } else {
+            log::debug!("No token file found at {}", token_path.display());
             None
         }
     }

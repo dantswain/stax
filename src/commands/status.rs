@@ -7,6 +7,7 @@ use anyhow::Result;
 use colored::*;
 
 pub async fn run() -> Result<()> {
+    log::debug!("status: gathering repository status");
     let git = GitRepo::open(".")?;
 
     if !git.is_clean()? {

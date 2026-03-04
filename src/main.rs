@@ -10,6 +10,9 @@ use stax::AuthCommands;
 #[command(about = "A fast CLI tool for managing stacked pull requests")]
 #[command(version)]
 struct Cli {
+    #[arg(short, long, global = true, help = "Enable debug logging")]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -59,6 +62,18 @@ enum Commands {
     #[command(about = "Manage configuration")]
     #[command(subcommand)]
     Config(ConfigCommands),
+    #[command(about = "Show or tail the log file")]
+    Log {
+        #[arg(short = 'f', long, help = "Follow log output")]
+        follow: bool,
+        #[arg(
+            short = 'n',
+            long,
+            default_value = "50",
+            help = "Number of lines to show"
+        )]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -73,8 +88,31 @@ enum ConfigCommands {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
     let cli = Cli::parse();
+
+    // Resolve log level: --verbose > STAX_LOG env var > config file > "error"
+    let log_level = if cli.verbose {
+        ::log::LevelFilter::Debug
+    } else if let Ok(env_level) = std::env::var("STAX_LOG") {
+        stax::logging::parse_level(&env_level)
+    } else {
+        let level_str = stax::config::Config::load()
+            .map(|c| c.log_level)
+            .unwrap_or_else(|_| "error".to_string());
+        stax::logging::parse_level(&level_str)
+    };
+
+    // Initialize logging (non-fatal: warn to stderr if it fails)
+    if let Err(e) = stax::logging::init(log_level) {
+        eprintln!("Warning: could not initialize logging: {e}");
+    }
+
+    ::log::debug!(
+        "stax {} starting, command: {:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::args().collect::<Vec<_>>()
+    );
+    ::log::debug!("working directory: {:?}", std::env::current_dir().ok());
 
     let result = match cli.command {
         Commands::Auth { command } => auth::run(command).await,
@@ -97,9 +135,11 @@ async fn main() {
             ConfigCommands::Get { key } => commands::config::get(&key).await,
             ConfigCommands::List => commands::config::list().await,
         },
+        Commands::Log { follow, lines } => commands::log::run(follow, lines).await,
     };
 
     if let Err(e) = result {
+        ::log::error!("Command failed: {e:#}");
         eprintln!("Error: {e}");
         process::exit(1);
     }

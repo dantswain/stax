@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod git;
 pub mod github;
+pub mod logging;
 pub mod oauth;
 pub mod stack;
 pub mod token_store;

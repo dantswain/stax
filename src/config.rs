@@ -10,6 +10,8 @@ pub struct Config {
     pub auto_push: bool,
     pub draft_prs: bool,
     pub pr_template: Option<String>,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     #[serde(default)]
     pub user_settings: HashMap<String, String>,
 }
@@ -21,6 +23,7 @@ impl Default for Config {
             auto_push: true,
             draft_prs: false,
             pr_template: None,
+            log_level: default_log_level(),
             user_settings: HashMap::new(),
         }
     }
@@ -31,10 +34,12 @@ impl Config {
         let config_path = get_config_path()?;
 
         if config_path.exists() {
+            log::debug!("Loading config from {}", config_path.display());
             let content = fs::read_to_string(&config_path)?;
             let config: Config = toml::from_str(&content)?;
             Ok(config)
         } else {
+            log::debug!("No config file found, using defaults");
             Ok(Config::default())
         }
     }
@@ -72,6 +77,10 @@ impl Config {
         content.push_str(&format!("draft_prs = {}\n", self.draft_prs));
         content.push('\n');
 
+        content.push_str("# Log level: error, warn, info, debug, trace\n");
+        content.push_str(&format!("log_level = \"{}\"\n", self.log_level));
+        content.push('\n');
+
         if let Some(template) = &self.pr_template {
             content.push_str("# Default PR template\n");
             content.push_str(&format!("pr_template = '''\n{template}\n\'''\n"));
@@ -100,6 +109,17 @@ impl Config {
             "auto_push" => self.auto_push = value.parse()?,
             "draft_prs" => self.draft_prs = value.parse()?,
             "pr_template" => self.pr_template = Some(value.to_string()),
+            "log_level" => {
+                let valid = ["error", "warn", "info", "debug", "trace"];
+                if valid.contains(&value) {
+                    self.log_level = value.to_string();
+                } else {
+                    return Err(anyhow!(
+                        "Invalid log level '{}'. Valid values: error, warn, info, debug, trace",
+                        value
+                    ));
+                }
+            }
             _ => {
                 self.user_settings
                     .insert(key.to_string(), value.to_string());
@@ -114,6 +134,7 @@ impl Config {
             "auto_push" => Some(self.auto_push.to_string()),
             "draft_prs" => Some(self.draft_prs.to_string()),
             "pr_template" => self.pr_template.clone(),
+            "log_level" => Some(self.log_level.clone()),
             _ => self.user_settings.get(key).cloned(),
         }
     }
@@ -127,6 +148,7 @@ impl Config {
         );
         settings.insert("auto_push".to_string(), self.auto_push.to_string());
         settings.insert("draft_prs".to_string(), self.draft_prs.to_string());
+        settings.insert("log_level".to_string(), self.log_level.clone());
 
         if let Some(template) = &self.pr_template {
             settings.insert("pr_template".to_string(), template.clone());
@@ -151,6 +173,7 @@ mod tests {
         assert!(config.auto_push);
         assert!(!config.draft_prs);
         assert!(config.pr_template.is_none());
+        assert_eq!(config.log_level, "error");
         assert!(config.user_settings.is_empty());
     }
 
@@ -200,6 +223,46 @@ mod tests {
     }
 
     #[test]
+    fn test_config_log_level_set_and_get() {
+        let mut config = Config::default();
+
+        config.set("log_level", "debug").unwrap();
+        assert_eq!(config.log_level, "debug");
+        assert_eq!(config.get("log_level"), Some("debug".to_string()));
+
+        config.set("log_level", "trace").unwrap();
+        assert_eq!(config.log_level, "trace");
+    }
+
+    #[test]
+    fn test_config_log_level_invalid() {
+        let mut config = Config::default();
+        let result = config.set("log_level", "verbose");
+        assert!(result.is_err());
+        // Original value should be unchanged
+        assert_eq!(config.log_level, "error");
+    }
+
+    #[test]
+    fn test_config_log_level_in_list() {
+        let config = Config::default();
+        let settings = config.list();
+        assert_eq!(settings.get("log_level"), Some(&"error".to_string()));
+    }
+
+    #[test]
+    fn test_config_backwards_compatible_without_log_level() {
+        // Old config files without log_level should deserialize fine
+        let toml = r#"
+            default_base_branch = "main"
+            auto_push = true
+            draft_prs = false
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.log_level, "error");
+    }
+
+    #[test]
     fn test_config_invalid_bool() {
         let mut config = Config::default();
         let result = config.set("auto_push", "invalid_bool");
@@ -226,6 +289,7 @@ mod tests {
         // Check that values are correct
         assert!(toml_content.contains("default_base_branch = \"develop\""));
         assert!(toml_content.contains("auto_push = false"));
+        assert!(toml_content.contains("log_level = \"error\""));
         assert!(toml_content.contains("pr_template = '''"));
         assert!(toml_content.contains("[user_settings]"));
         assert!(toml_content.contains("custom_key = \"custom_value\""));
@@ -257,6 +321,10 @@ mod tests {
         #[cfg(not(target_os = "windows"))]
         assert!(dir_str.contains(".config"));
     }
+}
+
+fn default_log_level() -> String {
+    "error".to_string()
 }
 
 fn get_config_path() -> Result<PathBuf> {

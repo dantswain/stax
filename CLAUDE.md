@@ -44,7 +44,8 @@ All commands follow this pattern:
 - **`git.rs`**: Wraps `git2` crate. `GitRepo` struct provides branch operations, push (with force-push-with-lease), merge-base detection, `rebase_onto_with_base` (uses `--onto` to avoid replaying parent commits), `rebase_continue`, `is_rebase_in_progress`, and `has_diverged_from_remote`. SSH auth tries key files directly (agent auth commented out due to loop issue).
 - **`github.rs`**: `GitHubClient` wraps `octocrab`. Parses both HTTPS and SSH remote URLs via `parse_github_url()`. Custom `PullRequest` struct (not octocrab's) used throughout. `format_github_error()` extracts useful messages from octocrab's opaque error types. Includes PR comment methods for stack visualization.
 - **`stack.rs`**: `Stack::analyze()` builds the branch graph. `detect_relationships()` infers parent-child by checking if a branch's merge-base with another equals that branch's tip (closest such branch wins). Pre-computes commit hashes and merged-branch status to avoid redundant git calls. Falls back to main/master/develop as parent.
-- **`config.rs`**: TOML config at XDG-compliant paths. Key fields: `default_base_branch`, `auto_push`, `draft_prs`, `pr_template`.
+- **`config.rs`**: TOML config at XDG-compliant paths. Key fields: `default_base_branch`, `auto_push`, `draft_prs`, `pr_template`, `log_level`.
+- **`logging.rs`**: File-based logging via `fern` + `log` facade. `get_log_dir()` returns platform-specific path (macOS: `~/Library/Logs/stax/`, Linux: `~/.local/state/stax/logs/`). `init()` sets up fern dispatch with formatted output, dependency noise suppression, and simple 5MB rotation. Log level resolved in main.rs: `--verbose` flag > `STAX_LOG` env var > config `log_level` > default `"error"`. Non-fatal init — CLI continues even if logging setup fails.
 - **`oauth.rs`**: GitHub device flow auth (uses GitHub CLI's client ID: `178c6fc778ccc68e1d6a`).
 - **`token_store.rs`**: Token stored at `~/.stax/token` with 0o600 permissions.
 - **`utils.rs`**: `print_success/info/warning/error` colored output, `confirm()` prompts, `input_or_editor()` (Ctrl+G to open `$EDITOR`), `open_editor()` (invokes editor via shell for proper env var expansion).
@@ -59,6 +60,7 @@ All commands follow this pattern:
 - `stax up` / `stax down` / `stax top` / `stax bottom` - Navigate the stack
 - `stax status` - Show current repository status
 - `stax config set/get/list` - Configuration management
+- `stax log [-f] [-n N]` - Show or tail the log file; `-f` follows, `-n` sets line count
 
 ## Key Patterns
 
@@ -70,3 +72,4 @@ All commands follow this pattern:
 - On rebase conflict, the rebase is left in progress for the user to resolve; `--continue` resumes
 - Main/master/develop are treated as root branches and excluded from PR operations
 - Navigate commands (`up`/`down`/`top`/`bottom`) do targeted O(n) lookups instead of full O(n²) stack analysis
+- Debug logging uses `log::debug!` throughout; all major operations (git, GitHub API, stack analysis, commands) emit debug-level messages suitable for LLM-assisted troubleshooting

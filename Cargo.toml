@@ -33,7 +33,7 @@ reqwest = { version = "0.11", features = ["json"] }
 webbrowser = "0.8"
 libc = "0.2"
 log = "0.4"
-env_logger = "0.11"
+fern = "0.7"
 tempfile = "3.8"
 
 [dev-dependencies]

@@ -9,6 +9,11 @@ pub struct GitRepo {
 impl GitRepo {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let repo = Repository::discover(path)?;
+        log::debug!(
+            "Opened git repo at {:?}",
+            repo.workdir()
+                .unwrap_or_else(|| std::path::Path::new("(bare)"))
+        );
         Ok(GitRepo { repo })
     }
 
@@ -36,6 +41,7 @@ impl GitRepo {
     }
 
     pub fn create_branch(&self, name: &str, from_ref: Option<&str>) -> Result<()> {
+        log::debug!("Creating branch '{}' from {:?}", name, from_ref);
         let target_commit = if let Some(from) = from_ref {
             let reference = self.repo.find_reference(from)?;
             self.repo.reference_to_annotated_commit(&reference)?
@@ -51,6 +57,7 @@ impl GitRepo {
     }
 
     pub fn checkout_branch(&self, name: &str) -> Result<()> {
+        log::debug!("Checking out branch '{}'", name);
         let obj = self.repo.revparse_single(&format!("refs/heads/{name}"))?;
         self.repo.checkout_tree(&obj, None)?;
         self.repo.set_head(&format!("refs/heads/{name}"))?;
@@ -106,6 +113,7 @@ impl GitRepo {
     }
 
     pub fn push_branch(&self, branch_name: &str, force: bool) -> Result<()> {
+        log::debug!("Pushing branch '{}' (force={})", branch_name, force);
         let workdir = self.workdir()?;
         let mut args = vec!["push", "origin"];
         if force {
@@ -155,6 +163,7 @@ impl GitRepo {
     /// Check if local branch has diverged from its remote counterpart
     /// (i.e., after a rebase, the two share history but are not fast-forward).
     pub fn has_diverged_from_remote(&self, branch_name: &str) -> Result<bool> {
+        log::debug!("Checking divergence for '{}'", branch_name);
         let local_ref = format!("refs/heads/{branch_name}");
         let remote_ref = format!("refs/remotes/origin/{branch_name}");
 
@@ -243,6 +252,12 @@ impl GitRepo {
         onto: &str,
         old_onto_commit: Option<&str>,
     ) -> Result<()> {
+        log::debug!(
+            "Rebasing '{}' onto '{}' (old_base={:?})",
+            branch,
+            onto,
+            old_onto_commit
+        );
         // Skip if branch is already based on onto
         let onto_commit = self.get_commit_hash(&format!("refs/heads/{onto}"))?;
         if let Ok(merge_base) = self.get_merge_base(branch, onto) {
@@ -257,15 +272,24 @@ impl GitRepo {
             Some(old_base) => {
                 // --onto <new_parent> <old_parent_tip> <branch>
                 // Only replays commits that are unique to <branch> (after old_parent_tip)
+                log::debug!(
+                    "Running: git rebase --onto {} {} {}",
+                    onto,
+                    old_base,
+                    branch
+                );
                 std::process::Command::new("git")
                     .args(["rebase", "--onto", onto, old_base, branch])
                     .current_dir(workdir)
                     .output()?
             }
-            None => std::process::Command::new("git")
-                .args(["rebase", onto, branch])
-                .current_dir(workdir)
-                .output()?,
+            None => {
+                log::debug!("Running: git rebase {} {}", onto, branch);
+                std::process::Command::new("git")
+                    .args(["rebase", onto, branch])
+                    .current_dir(workdir)
+                    .output()?
+            }
         };
 
         if output.status.success() {
@@ -285,6 +309,7 @@ impl GitRepo {
     }
 
     pub fn rebase_continue(&self) -> Result<()> {
+        log::debug!("Running: git rebase --continue");
         let workdir = self.workdir()?;
 
         let output = std::process::Command::new("git")
@@ -314,6 +339,7 @@ impl GitRepo {
     }
 
     pub fn fetch(&self) -> Result<()> {
+        log::debug!("Running: git fetch --prune origin");
         let workdir = self.workdir()?;
         let output = std::process::Command::new("git")
             .args(["fetch", "--prune", "origin"])
@@ -330,6 +356,7 @@ impl GitRepo {
     /// Fast-forward a local branch to match its remote tracking branch.
     /// Returns Ok(true) if the branch was updated, Ok(false) if already up to date.
     pub fn fast_forward_branch(&self, branch_name: &str) -> Result<bool> {
+        log::debug!("Fast-forwarding branch '{}'", branch_name);
         let local_ref_name = format!("refs/heads/{branch_name}");
         let remote_ref_name = format!("refs/remotes/origin/{branch_name}");
 
@@ -389,6 +416,11 @@ impl GitRepo {
 
     /// Delete a local branch and optionally its remote counterpart.
     pub fn delete_branch(&self, branch_name: &str, delete_remote: bool) -> Result<()> {
+        log::debug!(
+            "Deleting branch '{}' (delete_remote={})",
+            branch_name,
+            delete_remote
+        );
         // Delete local branch
         let mut branch = self.repo.find_branch(branch_name, BranchType::Local)?;
         branch.delete()?;
