@@ -2077,6 +2077,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "git2",
+ "libc",
  "log",
  "mockall",
  "octocrab",
