@@ -1,3 +1,4 @@
+use crate::cache::StackCache;
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
 use crate::{token_store, utils};
@@ -664,6 +665,284 @@ pub fn get_branches_with_cache(
     Ok((all, commits, merged))
 }
 
+/// Load branches, commit hashes, merged status, and parent map.
+///
+/// Uses a local cache (`.git/stax/cache.json`) when all branch tips match,
+/// falling back to full recomputation on any cache miss or error.  On a full
+/// or partial recompute the cache is updated for next time.
+#[allow(clippy::type_complexity)]
+pub fn get_branches_and_parent_map(
+    git: &GitRepo,
+) -> Result<(
+    Vec<String>,
+    HashMap<String, String>,
+    HashSet<String>,
+    HashMap<String, Option<String>>,
+)> {
+    // 1. Enumerate branches and build commit cache (microseconds — just ref reads)
+    let all = git.get_branches()?;
+    let commits = build_commit_cache(git, &all)?;
+
+    let trunk_name = all
+        .iter()
+        .find(|b| is_main_branch(b))
+        .cloned()
+        .unwrap_or_else(|| "main".to_string());
+
+    // 2. Try cache
+    let mut cache = StackCache::new(&git.git_dir());
+
+    if cache.load().is_some() {
+        if let Some(validation) = cache.validate(&commits, &trunk_name) {
+            let is_full_hit = validation.stale.is_empty()
+                && validation.new_branches.is_empty()
+                && validation.deleted.is_empty()
+                && !validation.trunk_changed;
+
+            if is_full_hit {
+                // === FULL CACHE HIT ===
+                log::debug!("cache: full hit, skipping recompute");
+                let data = cache.data_ref().unwrap();
+                let parent_map = StackCache::to_parent_map(data);
+                let merged = StackCache::to_merged_set(data);
+                return Ok((all, commits, merged, parent_map));
+            }
+
+            // === PARTIAL CACHE HIT ===
+            let merged = if validation.trunk_changed {
+                log::debug!("cache: trunk changed, recomputing merged set");
+                compute_merged_set(git, &all, &commits)?
+            } else {
+                validation.cached_merged
+            };
+
+            // Start with valid entries
+            let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+            for b in &all {
+                if is_main_branch(b) {
+                    parent_map.insert(b.clone(), None);
+                }
+            }
+            for (name, cached) in &validation.valid {
+                if !merged.contains(name) {
+                    parent_map.insert(name.clone(), cached.parent.clone());
+                }
+            }
+
+            // Identify branches needing recompute
+            let mut needs_recompute: HashSet<String> = HashSet::new();
+            needs_recompute.extend(validation.stale.iter().cloned());
+            needs_recompute.extend(validation.new_branches.iter().cloned());
+            // Also recompute branches whose cached parent is stale or deleted
+            for (name, cached) in &validation.valid {
+                if let Some(ref parent) = cached.parent {
+                    if validation.stale.contains(parent) || validation.deleted.contains(parent) {
+                        log::debug!(
+                            "cache: {} needs recompute (parent {} is stale/deleted)",
+                            name,
+                            parent,
+                        );
+                        needs_recompute.insert(name.clone());
+                    }
+                }
+            }
+
+            // Filter to active (non-main, non-merged) branches
+            let recompute_vec: Vec<&String> = needs_recompute
+                .iter()
+                .filter(|b| !is_main_branch(b) && !merged.contains(*b))
+                .collect();
+
+            log::debug!(
+                "cache: partial hit, recomputing {} branches",
+                recompute_vec.len()
+            );
+
+            if !recompute_vec.is_empty() {
+                let recomputed = recompute_parents(git, &recompute_vec, &all, &commits, &merged)?;
+                for (branch, parent) in recomputed {
+                    parent_map.insert(branch, parent);
+                }
+            }
+
+            // Save updated cache
+            let trunk_tip = commits.get(&trunk_name).cloned().unwrap_or_default();
+            let data = StackCache::build_cache_data(
+                &trunk_name,
+                &trunk_tip,
+                &parent_map,
+                &commits,
+                &merged,
+            );
+            cache.save(&data);
+
+            return Ok((all, commits, merged, parent_map));
+        }
+    }
+
+    // === CACHE MISS ===
+    log::debug!("cache: miss, full recompute ({} branches)", all.len());
+    let merged = compute_merged_set(git, &all, &commits)?;
+    let parent_map = build_parent_map(git, &all, &commits, &merged)?;
+
+    // Save for next time
+    let trunk_tip = commits.get(&trunk_name).cloned().unwrap_or_default();
+    let data =
+        StackCache::build_cache_data(&trunk_name, &trunk_tip, &parent_map, &commits, &merged);
+    cache.save(&data);
+
+    Ok((all, commits, merged, parent_map))
+}
+
+/// Compute the merged set — branches whose tip equals their merge-base with
+/// trunk.  Parallelised with `std::thread::scope`.
+fn compute_merged_set(
+    git: &GitRepo,
+    all: &[String],
+    commits: &HashMap<String, String>,
+) -> Result<HashSet<String>> {
+    let trunk = match all.iter().find(|b| is_main_branch(b)) {
+        Some(t) => t,
+        None => {
+            log::debug!("compute_merged_set: no trunk branch found, returning empty set");
+            return Ok(HashSet::new());
+        }
+    };
+
+    let candidates: Vec<&String> = all
+        .iter()
+        .filter(|b| !is_main_branch(b) && commits.contains_key(*b))
+        .collect();
+
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(candidates.len());
+
+    if num_threads <= 1 {
+        return Ok(candidates
+            .iter()
+            .filter(|b| {
+                let bh = &commits[**b];
+                git.get_merge_base(b, trunk)
+                    .map(|mb| *bh == mb.to_string())
+                    .unwrap_or(false)
+            })
+            .map(|b| (*b).clone())
+            .collect());
+    }
+
+    let repo_path = git.repo_workdir()?;
+    let chunk_size = candidates.len().div_ceil(num_threads);
+
+    let results: Vec<Vec<String>> = std::thread::scope(|s| {
+        let handles: Vec<_> = candidates
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    let git = GitRepo::open(&repo_path).ok()?;
+                    Some(
+                        chunk
+                            .iter()
+                            .filter(|b| {
+                                let bh = &commits[**b];
+                                git.get_merge_base(b, trunk)
+                                    .map(|mb| *bh == mb.to_string())
+                                    .unwrap_or(false)
+                            })
+                            .map(|b| (*b).clone())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("thread panicked"))
+            .collect()
+    });
+
+    let merged: HashSet<String> = results.into_iter().flatten().collect();
+    log::debug!(
+        "compute_merged_set: found {} merged branches out of {} candidates",
+        merged.len(),
+        candidates.len()
+    );
+    if !merged.is_empty() {
+        let names: Vec<&String> = merged.iter().collect();
+        log::debug!("compute_merged_set: merged branches: {names:?}");
+    }
+    Ok(merged)
+}
+
+/// Recompute parents for a subset of branches.  Uses the same parallel
+/// `std::thread::scope` pattern as `build_parent_map`.
+fn recompute_parents(
+    git: &GitRepo,
+    branches: &[&String],
+    all_branches: &[String],
+    commits: &HashMap<String, String>,
+    merged: &HashSet<String>,
+) -> Result<Vec<(String, Option<String>)>> {
+    let branch_names: Vec<&str> = branches.iter().map(|b| b.as_str()).collect();
+    log::debug!(
+        "recompute_parents: recomputing {} branches: {branch_names:?}",
+        branches.len()
+    );
+
+    if branches.len() <= 1 {
+        let mut out = Vec::new();
+        for branch in branches {
+            let parent = find_parent(git, branch, all_branches, commits, merged)?;
+            log::debug!("recompute_parents: {} -> {:?}", branch, parent);
+            out.push(((*branch).clone(), parent));
+        }
+        return Ok(out);
+    }
+
+    let repo_path = git.repo_workdir()?;
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(branches.len());
+    let chunk_size = branches.len().div_ceil(num_threads);
+
+    #[allow(clippy::type_complexity)]
+    let results: Result<Vec<Vec<(String, Option<String>)>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = branches
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    let git = GitRepo::open(&repo_path)?;
+                    chunk
+                        .iter()
+                        .map(|branch| {
+                            let parent = find_parent(&git, branch, all_branches, commits, merged)?;
+                            Ok(((*branch).clone(), parent))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect()
+    });
+
+    let out: Vec<(String, Option<String>)> = results?.into_iter().flatten().collect();
+    for (branch, parent) in &out {
+        log::debug!("recompute_parents: {} -> {:?}", branch, parent);
+    }
+    Ok(out)
+}
+
 pub async fn down() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
@@ -673,8 +952,10 @@ pub async fn down() -> Result<()> {
         return Err(anyhow!("Already at the bottom of the stack"));
     }
 
-    let (branches, commits, merged) = get_branches_with_cache(&git)?;
-    let parent = find_parent(&git, &current, &branches, &commits, &merged)?
+    let (_branches, _commits, _merged, parent_map) = get_branches_and_parent_map(&git)?;
+    let parent = parent_map
+        .get(&current)
+        .and_then(|p| p.clone())
         .ok_or_else(|| anyhow!("Already at the bottom of the stack"))?;
     log::debug!("navigate down: target='{}'", parent);
 
@@ -687,8 +968,7 @@ pub async fn up() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
     log::debug!("navigate up: current='{}'", current);
-    let (branches, commits, merged) = get_branches_with_cache(&git)?;
-    let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
 
     let children = if is_main_branch(&current) {
         root_children_from_map(&current, &parent_map, &merged)
@@ -724,8 +1004,7 @@ pub async fn bottom() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
     log::debug!("navigate bottom: current='{}'", current);
-    let (branches, commits, merged) = get_branches_with_cache(&git)?;
-    let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
 
     if is_main_branch(&current) {
         let children = root_children_from_map(&current, &parent_map, &merged);
@@ -828,15 +1107,14 @@ pub async fn top() -> Result<()> {
     log::debug!("navigate top: current='{}'", current);
 
     // Fire off GitHub API call immediately so it runs concurrently with
-    // the expensive build_parent_map git work below.
+    // the (potentially expensive) parent-map computation below.
     let pr_handle = if is_main_branch(&current) {
         spawn_open_pr_branches(&git)
     } else {
         None
     };
 
-    let (branches, commits, merged) = get_branches_with_cache(&git)?;
-    let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
 
     let ctx = BranchContext {
         git: &git,

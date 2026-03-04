@@ -280,6 +280,11 @@ impl GitRepo {
         Ok(self.workdir()?.to_path_buf())
     }
 
+    /// Return the path to the `.git` directory (for per-repo storage like caches).
+    pub fn git_dir(&self) -> std::path::PathBuf {
+        self.repo.path().to_path_buf()
+    }
+
     /// Rebase `branch` onto `onto`.
     /// If `old_onto_commit` is provided, uses `--onto` to only replay commits
     /// after the old parent tip (avoids re-applying parent's commits).

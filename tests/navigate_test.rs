@@ -1,9 +1,11 @@
 mod common;
 
 use common::{add_commit, create_branch_with_commit, create_test_repo, git};
+use stax::cache::StackCache;
 use stax::commands::navigate::{
     build_commit_cache, build_parent_map, children_from_map, find_children, find_parent,
-    get_branches_with_cache, is_active_stack, is_main_branch, root_children_from_map, walk_to_top,
+    get_branches_and_parent_map, get_branches_with_cache, is_active_stack, is_main_branch,
+    root_children_from_map, walk_to_top,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -867,4 +869,247 @@ fn test_full_pipeline_with_fork() {
     let mut children = children_from_map("A", &map, &merged);
     children.sort();
     assert_eq!(children, vec!["B", "C"]);
+}
+
+// ── get_branches_and_parent_map (cache integration) ──────────────────────────
+
+#[test]
+fn test_cache_cold_writes_file() {
+    // On first call with no cache, the function should write a cache file.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    let cache_path = repo.git_dir().join("stax").join("cache.json");
+    assert!(
+        !cache_path.exists(),
+        "cache should not exist before first call"
+    );
+
+    let (branches, _commits, merged, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+
+    assert!(
+        cache_path.exists(),
+        "cache should be written after first call"
+    );
+    assert!(branches.contains(&"main".to_string()));
+    assert!(branches.contains(&"A".to_string()));
+    assert!(branches.contains(&"B".to_string()));
+    assert_eq!(parent_map.get("A").unwrap().as_deref(), Some("main"));
+    assert_eq!(parent_map.get("B").unwrap().as_deref(), Some("A"));
+    assert!(merged.is_empty());
+}
+
+#[test]
+fn test_cache_warm_hit_returns_same_results() {
+    // Call twice without changing anything — second call should be a cache hit
+    // and return identical results.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+
+    // First call: cold cache
+    let (branches1, commits1, merged1, parent_map1) = get_branches_and_parent_map(&repo).unwrap();
+
+    // Second call: should be a full cache hit
+    let (branches2, commits2, merged2, parent_map2) = get_branches_and_parent_map(&repo).unwrap();
+
+    assert_eq!(branches1, branches2);
+    assert_eq!(commits1, commits2);
+    assert_eq!(merged1, merged2);
+    assert_eq!(parent_map1, parent_map2);
+
+    // Verify the parent chain
+    assert_eq!(parent_map2.get("A").unwrap().as_deref(), Some("main"));
+    assert_eq!(parent_map2.get("B").unwrap().as_deref(), Some("A"));
+    assert_eq!(parent_map2.get("C").unwrap().as_deref(), Some("B"));
+}
+
+#[test]
+fn test_cache_partial_hit_stale_branch() {
+    // First call populates cache, then amend a commit on a branch to change
+    // its tip — second call should do a partial recompute.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    // First call: cold cache, writes cache file
+    let (_b1, _c1, _m1, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("A"));
+
+    // Amend B's commit to change its tip
+    git(p, &["checkout", "B"]);
+    add_commit(p, "B_extra.txt", "extra content on B");
+
+    // Second call: partial cache hit (B is stale)
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+
+    // B's parent should still be A after recompute
+    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("A"));
+    assert_eq!(pm2.get("A").unwrap().as_deref(), Some("main"));
+}
+
+#[test]
+fn test_cache_partial_hit_new_branch() {
+    // First call populates cache, then create a new branch — second call
+    // should detect the new branch and compute its parent.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+
+    // First call: cold cache
+    let (_b1, _c1, _m1, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert!(!pm1.contains_key("B"), "B doesn't exist yet");
+
+    // Create a new branch B off A
+    create_branch_with_commit(p, "B", "A");
+
+    // Second call: partial hit (B is new)
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("A"));
+}
+
+#[test]
+fn test_cache_handles_deleted_branch() {
+    // First call populates cache with A and B, then delete B.
+    // Second call should still work correctly.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    // First call: cold cache with A and B
+    let (_b1, _c1, _m1, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert!(pm1.contains_key("B"));
+
+    // Delete branch B
+    git(p, &["checkout", "main"]);
+    git(p, &["branch", "-D", "B"]);
+
+    // Second call: B is in cache but deleted from git
+    let (branches2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert!(!branches2.contains(&"B".to_string()));
+    assert_eq!(pm2.get("A").unwrap().as_deref(), Some("main"));
+}
+
+#[test]
+fn test_cache_trunk_tip_changed() {
+    // When trunk (main) tip changes, merged set must be recomputed.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    // First call: cold cache
+    let (_b1, _c1, merged1, _pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert!(merged1.is_empty());
+
+    // Advance main (changes trunk tip, triggers trunk_changed)
+    git(p, &["checkout", "main"]);
+    add_commit(p, "main_extra.txt", "extra on main");
+
+    // Second call: trunk changed
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+
+    // Parent relationships should still be correct
+    assert_eq!(pm2.get("A").unwrap().as_deref(), Some("main"));
+    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("A"));
+}
+
+#[test]
+fn test_cache_corrupt_file_recovers() {
+    // If cache file is corrupt, the function should fall back to full recompute.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+
+    // Write a corrupt cache file
+    let stax_dir = repo.git_dir().join("stax");
+    std::fs::create_dir_all(&stax_dir).unwrap();
+    std::fs::write(stax_dir.join("cache.json"), "not valid json {{{").unwrap();
+
+    // Should gracefully degrade to full recompute
+    let (_branches, _commits, _merged, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+
+    assert_eq!(parent_map.get("A").unwrap().as_deref(), Some("main"));
+
+    // Cache should be repaired (overwritten with valid data)
+    let mut cache = StackCache::new(&repo.git_dir());
+    assert!(
+        cache.load().is_some(),
+        "cache should be valid after recovery"
+    );
+}
+
+#[test]
+fn test_cache_with_merged_branch() {
+    // Verify cache works when there are merged branches.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    // Merge A into main
+    git(p, &["checkout", "main"]);
+    git(p, &["merge", "A", "--no-ff", "-m", "merge A"]);
+
+    // First call: cold cache
+    let (_b1, _c1, merged1, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert!(merged1.contains("A"), "A should be merged");
+    assert!(
+        !pm1.contains_key("A"),
+        "merged A should not be in parent map"
+    );
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("main"));
+
+    // Second call: warm cache — should return same results
+    let (_b2, _c2, merged2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(merged1, merged2);
+    assert_eq!(pm1, pm2);
+}
+
+#[test]
+fn test_cache_stale_parent_triggers_child_recompute() {
+    // If A's tip changes, B (whose cached parent is A) should also be
+    // recomputed because its parent relationship may have changed.
+    //
+    // When A advances without restacking B, B's closest ancestor branch
+    // becomes main (A's tip is no longer in B's ancestry). This is correct
+    // behavior — B would need restacking to be back on top of A.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+
+    // First call: cold cache
+    let (_b1, _c1, _m1, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("A"));
+    assert_eq!(pm1.get("C").unwrap().as_deref(), Some("B"));
+
+    // Advance A (makes A stale, which should also trigger B recompute)
+    git(p, &["checkout", "A"]);
+    add_commit(p, "A_extra.txt", "extra commit on A");
+
+    // Second call: partial hit — A is stale, B should be recomputed
+    // because its cached parent (A) is stale.
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm2.get("A").unwrap().as_deref(), Some("main"));
+    // B's parent changes to main because A's tip has moved past B's
+    // branch point (A advanced without restacking B)
+    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("main"));
+    assert_eq!(pm2.get("C").unwrap().as_deref(), Some("B"));
 }
