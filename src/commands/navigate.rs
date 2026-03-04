@@ -1,6 +1,5 @@
 use crate::git::GitRepo;
 use crate::github::GitHubClient;
-use crate::stack::is_merged_into;
 use crate::{token_store, utils};
 use anyhow::{anyhow, Result};
 use colored::*;
@@ -436,8 +435,9 @@ pub fn find_children(
 }
 
 /// Build a map from each branch to its parent (via `find_parent`).
-/// This is O(n²) merge-base calls total but only runs **once**; every
-/// subsequent lookup (children, root-children, walk-to-top) is O(1).
+/// Runs `find_parent` calls in parallel across multiple threads, each with
+/// its own `GitRepo` handle. This turns O(n²) sequential merge-base calls
+/// into ~O(n²/threads) wall-clock time.
 ///
 /// Merged branches are skipped — they don't need parent computation since
 /// they'll never be navigation targets.  This is the biggest perf win in
@@ -449,17 +449,73 @@ pub fn build_parent_map(
     merged: &HashSet<String>,
 ) -> Result<HashMap<String, Option<String>>> {
     let mut map = HashMap::new();
+
+    // Separate main branches (trivial: parent = None) from active branches
+    // that need find_parent.
+    let mut active: Vec<&String> = Vec::new();
     for branch in all_branches {
         if is_main_branch(branch) {
             map.insert(branch.clone(), None);
-            continue;
+        } else if !merged.contains(branch) {
+            active.push(branch);
         }
-        if merged.contains(branch) {
-            continue;
-        }
-        let parent = find_parent(git, branch, all_branches, commits, merged)?;
-        map.insert(branch.clone(), parent);
     }
+
+    if active.is_empty() {
+        return Ok(map);
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(active.len());
+
+    if num_threads <= 1 {
+        // Not worth spawning threads for ≤1 active branch
+        for branch in &active {
+            let parent = find_parent(git, branch, all_branches, commits, merged)?;
+            map.insert((*branch).clone(), parent);
+        }
+        return Ok(map);
+    }
+
+    let repo_path = git.repo_workdir()?;
+    let chunk_size = active.len().div_ceil(num_threads);
+
+    // Each scoped thread opens its own GitRepo (git2::Repository is not
+    // Send/Sync, but multiple handles to the same .git dir are safe for
+    // read-only operations).  The commits/merged/all_branches refs are
+    // shared read-only.
+    #[allow(clippy::type_complexity)]
+    let results: Result<Vec<Vec<(String, Option<String>)>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = active
+            .chunks(chunk_size)
+            .map(|chunk| {
+                s.spawn(|| {
+                    let git = GitRepo::open(&repo_path)?;
+                    chunk
+                        .iter()
+                        .map(|branch| {
+                            let parent = find_parent(&git, branch, all_branches, commits, merged)?;
+                            Ok(((*branch).clone(), parent))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })
+            .collect();
+
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect()
+    });
+
+    for chunk_results in results? {
+        for (branch, parent) in chunk_results {
+            map.insert(branch, parent);
+        }
+    }
+
     Ok(map)
 }
 
@@ -541,10 +597,66 @@ pub fn get_branches_with_cache(
 
     let trunk = all.iter().find(|b| is_main_branch(b)).cloned();
     let merged = if let Some(ref trunk) = trunk {
-        all.iter()
-            .filter(|b| !is_main_branch(b) && is_merged_into(git, b, trunk))
-            .cloned()
-            .collect()
+        // Collect non-main branches that need a merge-base check
+        let candidates: Vec<&String> = all
+            .iter()
+            .filter(|b| !is_main_branch(b) && commits.contains_key(*b))
+            .collect();
+
+        if candidates.is_empty() {
+            HashSet::new()
+        } else {
+            let num_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(candidates.len());
+
+            if num_threads <= 1 {
+                candidates
+                    .iter()
+                    .filter(|b| {
+                        let bh = &commits[**b];
+                        git.get_merge_base(b, trunk)
+                            .map(|mb| *bh == mb.to_string())
+                            .unwrap_or(false)
+                    })
+                    .map(|b| (*b).clone())
+                    .collect()
+            } else {
+                let repo_path = git.repo_workdir()?;
+                let chunk_size = candidates.len().div_ceil(num_threads);
+
+                let results: Vec<Vec<String>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = candidates
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(|| {
+                                let git = GitRepo::open(&repo_path).ok()?;
+                                Some(
+                                    chunk
+                                        .iter()
+                                        .filter(|b| {
+                                            let bh = &commits[**b];
+                                            git.get_merge_base(b, trunk)
+                                                .map(|mb| *bh == mb.to_string())
+                                                .unwrap_or(false)
+                                        })
+                                        .map(|b| (*b).clone())
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                        })
+                        .collect();
+
+                    handles
+                        .into_iter()
+                        .filter_map(|h| h.join().expect("thread panicked"))
+                        .collect()
+                });
+
+                results.into_iter().flatten().collect()
+            }
+        }
     } else {
         HashSet::new()
     };
@@ -668,15 +780,19 @@ pub async fn bottom() -> Result<()> {
     Ok(())
 }
 
-/// Build a set of branch names that have an open (non-merged, non-closed) PR.
-/// Returns None if GitHub is unavailable (no token, no remote, etc.) so the
-/// caller can gracefully degrade.
-async fn open_pr_branches(git: &GitRepo) -> Option<HashSet<String>> {
+/// Spawn a background task to fetch open PR branch names from GitHub.
+/// Returns a JoinHandle so the caller can overlap git work with the network
+/// request.  Returns None if GitHub is unavailable (no token, no remote).
+fn spawn_open_pr_branches(
+    git: &GitRepo,
+) -> Option<tokio::task::JoinHandle<Option<HashSet<String>>>> {
     let token = token_store::get_token()?;
     let remote_url = git.get_remote_url("origin")?;
     let client = GitHubClient::new(&token, &remote_url).ok()?;
-    let prs = client.get_open_pull_requests().await.ok()?;
-    Some(prs.into_iter().map(|pr| pr.head_ref).collect())
+    Some(tokio::spawn(async move {
+        let prs = client.get_open_pull_requests().await.ok()?;
+        Some(prs.into_iter().map(|pr| pr.head_ref).collect())
+    }))
 }
 
 /// Returns true if the stack (represented by its root and top) should be
@@ -710,6 +826,15 @@ pub async fn top() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
     log::debug!("navigate top: current='{}'", current);
+
+    // Fire off GitHub API call immediately so it runs concurrently with
+    // the expensive build_parent_map git work below.
+    let pr_handle = if is_main_branch(&current) {
+        spawn_open_pr_branches(&git)
+    } else {
+        None
+    };
+
     let (branches, commits, merged) = get_branches_with_cache(&git)?;
     let parent_map = build_parent_map(&git, &branches, &commits, &merged)?;
 
@@ -736,8 +861,11 @@ pub async fn top() -> Result<()> {
             roots.push(root.clone());
         }
 
-        // Optionally fetch open PRs to filter dead single-branch stacks
-        let open_branches = open_pr_branches(&git).await;
+        // Await the GitHub API result (likely already finished by now)
+        let open_branches = match pr_handle {
+            Some(h) => h.await.ok().flatten(),
+            None => None,
+        };
 
         // Filter to active stacks only
         let (tops, roots): (Vec<_>, Vec<_>) = tops

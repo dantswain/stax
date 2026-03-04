@@ -1,9 +1,16 @@
 use anyhow::{anyhow, Result};
 use git2::{BranchType, Oid, Repository};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 
 pub struct GitRepo {
     repo: Repository,
+    /// Cache for revparse_single results (refspec → OID).
+    oid_cache: RefCell<HashMap<String, Oid>>,
+    /// Cache for merge-base results ((oid_a, oid_b) → merge-base OID).
+    /// Keys are normalized so the smaller OID comes first (merge-base is symmetric).
+    merge_base_cache: RefCell<HashMap<(Oid, Oid), Oid>>,
 }
 
 impl GitRepo {
@@ -14,7 +21,21 @@ impl GitRepo {
             repo.workdir()
                 .unwrap_or_else(|| std::path::Path::new("(bare)"))
         );
-        Ok(GitRepo { repo })
+        Ok(GitRepo {
+            repo,
+            oid_cache: RefCell::new(HashMap::new()),
+            merge_base_cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    /// Resolve a refspec to an OID, caching the result.
+    fn resolve_oid(&self, refspec: &str) -> Result<Oid> {
+        if let Some(&oid) = self.oid_cache.borrow().get(refspec) {
+            return Ok(oid);
+        }
+        let oid = self.repo.revparse_single(refspec)?.id();
+        self.oid_cache.borrow_mut().insert(refspec.to_string(), oid);
+        Ok(oid)
     }
 
     pub fn current_branch(&self) -> Result<String> {
@@ -194,16 +215,30 @@ impl GitRepo {
     }
 
     pub fn get_merge_base(&self, branch1: &str, branch2: &str) -> Result<Oid> {
-        let commit1 = self.repo.revparse_single(branch1)?.id();
-        let commit2 = self.repo.revparse_single(branch2)?.id();
-        Ok(self.repo.merge_base(commit1, commit2)?)
+        let commit1 = self.resolve_oid(branch1)?;
+        let commit2 = self.resolve_oid(branch2)?;
+
+        // Normalize key so (A,B) and (B,A) hit the same cache entry
+        let key = if commit1 <= commit2 {
+            (commit1, commit2)
+        } else {
+            (commit2, commit1)
+        };
+
+        if let Some(&mb) = self.merge_base_cache.borrow().get(&key) {
+            return Ok(mb);
+        }
+
+        let mb = self.repo.merge_base(commit1, commit2)?;
+        self.merge_base_cache.borrow_mut().insert(key, mb);
+        Ok(mb)
     }
 
     /// Count commits reachable from `to` but not from `from`.
     /// Equivalent to `git rev-list --count from..to`.
     pub fn count_commits_between(&self, from: &str, to: &str) -> Result<usize> {
-        let from_oid = self.repo.revparse_single(from)?.id();
-        let to_oid = self.repo.revparse_single(to)?.id();
+        let from_oid = self.resolve_oid(from)?;
+        let to_oid = self.resolve_oid(to)?;
 
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push(to_oid)?;
@@ -216,8 +251,8 @@ impl GitRepo {
     /// not reachable from `base`.  Commits are walked oldest-first so we get the
     /// first unique commit on the branch.
     pub fn first_commit_message(&self, base: &str, branch: &str) -> Result<Option<String>> {
-        let base_oid = self.repo.revparse_single(base)?.id();
-        let branch_oid = self.repo.revparse_single(branch)?.id();
+        let base_oid = self.resolve_oid(base)?;
+        let branch_oid = self.resolve_oid(branch)?;
 
         let mut revwalk = self.repo.revwalk()?;
         revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
@@ -237,6 +272,12 @@ impl GitRepo {
         self.repo
             .workdir()
             .ok_or_else(|| anyhow!("Cannot determine working directory"))
+    }
+
+    /// Return an owned path suitable for opening new `GitRepo` handles
+    /// (e.g. in spawned threads for parallel git operations).
+    pub fn repo_workdir(&self) -> Result<std::path::PathBuf> {
+        Ok(self.workdir()?.to_path_buf())
     }
 
     /// Rebase `branch` onto `onto`.
