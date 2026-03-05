@@ -16,6 +16,7 @@ Stax is inspired by [Graphite's CLI](https://graphite.com/docs/cli-overview) but
 - 🔄 **Branch Management**: Create new branches with proper parent-child relationships
 - 📝 **PR Integration**: Create and manage GitHub pull requests for your stack
 - 🔄 **Sync & Restack**: Keep your branches up to date with their parents
+- 🔧 **Topology Repair**: Automatically detect and fix broken branch relationships using PR data
 - ⚙️ **Configuration**: Flexible configuration management
 
 ## Example Usage
@@ -221,6 +222,15 @@ stax restack --all
 
 # Continue restack after resolving rebase conflicts
 stax restack --continue
+
+# Check branch topology against PR data (dry run)
+stax repair --check
+
+# Fix broken branch topology automatically
+stax repair
+
+# Continue repair after resolving rebase conflicts
+stax repair --continue
 ```
 
 ### Stack Navigation
@@ -338,20 +348,25 @@ cargo fmt
 
 ## Testing Coverage
 
-The project includes 88+ tests across unit and integration suites:
+The project includes 190 tests across unit and integration suites:
 
-- **Unit Tests** (in-module `#[cfg(test)]`):
-  - `config.rs` — Config defaults, set/get, TOML generation, path resolution
+- **Unit Tests** (83 tests, in-module `#[cfg(test)]`):
+  - `cache.rs` — Cache roundtrip, schema validation, restack state persistence, branch upsert, PR data
+  - `config.rs` — Config defaults, set/get, TOML generation, path resolution, log level
   - `github.rs` — URL parsing (SSH/HTTPS), PR struct serialization
+  - `git.rs` — Repo open, is_clean behavior, URL methods
+  - `logging.rs` — Log directory, level parsing
   - `stack.rs` — Stack creation, branch traversal, PR state validation
+  - `commands/submit.rs` — Stack comment formatting, PR status icons, branching topologies
   - `utils.rs` — String truncation edge cases
   - `oauth.rs` — Client creation, request structure validation
 
-- **Integration Tests** (`tests/`):
-  - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (24 tests using temp repos with bare remote origins)
-  - `stack_test.rs` — `Stack::analyze` with various topologies: linear, branching, diamond (12 async tests)
+- **Integration Tests** (107 tests, `tests/`):
+  - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (26 tests using temp repos with bare remote origins)
+  - `navigate_test.rs` — Parent detection, cache warm/cold/partial hits, PR overrides, topological walking, merged branch handling, fork detection (61 tests)
+  - `stack_test.rs` — `Stack::analyze` and `Stack::from_parent_map` with various topologies: linear, branching, diamond, PR overrides (14 async tests)
   - `restack_test.rs` — `rebase_onto` simple/noop/conflict/full-stack/branch-preservation (5 tests)
-  - `token_store_test.rs` — Token store/retrieve, overwrite, whitespace trimming, unix file permissions (5 tests)
+  - `token_store_test.rs` — Token store/retrieve, overwrite, whitespace trimming, unix file permissions (1 test)
 
 ## Project Structure
 
@@ -363,15 +378,18 @@ src/
 │   ├── auth.rs          # GitHub authentication (login/status)
 │   ├── branch.rs        # Branch creation
 │   ├── config.rs        # Configuration management
-│   ├── navigate.rs      # Stack navigation (up/down/top/bottom)
+│   ├── navigate.rs      # Stack navigation + parent detection + cache integration
+│   ├── repair.rs        # Topology repair using PR data as source of truth
 │   ├── restack.rs       # Branch restacking
 │   ├── stack.rs         # Stack visualization
 │   ├── status.rs        # Status display
 │   ├── submit.rs        # PR submission
 │   └── sync.rs          # Branch synchronization
+├── cache.rs             # Local metadata cache (.git/stax/cache.json)
 ├── config.rs            # Configuration handling
 ├── git.rs               # Git operations wrapper
 ├── github.rs            # GitHub API integration
+├── logging.rs           # File-based debug logging
 ├── oauth.rs             # GitHub device flow OAuth
 ├── stack.rs             # Stack analysis and management
 ├── token_store.rs       # Secure token storage (~/.stax/token)
@@ -379,6 +397,7 @@ src/
 tests/
 ├── common/mod.rs        # Shared test helpers (temp repo creation)
 ├── git_test.rs          # Git operations integration tests
+├── navigate_test.rs     # Navigation, cache, and parent detection tests
 ├── restack_test.rs      # Rebase integration tests
 ├── stack_test.rs        # Stack analysis integration tests
 └── token_store_test.rs  # Token storage integration tests
