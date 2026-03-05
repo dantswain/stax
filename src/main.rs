@@ -29,10 +29,7 @@ enum Commands {
     #[command(about = "Show visual stack structure")]
     Stack,
     #[command(about = "Create/update PRs")]
-    Submit {
-        #[arg(long, help = "Submit all branches in stack")]
-        all: bool,
-    },
+    Submit,
     #[command(about = "Sync with remote")]
     Sync {
         #[arg(long, help = "Skip restacking branches")]
@@ -41,11 +38,26 @@ enum Commands {
         force: bool,
         #[arg(long, help = "Continue after resolving rebase conflicts")]
         r#continue: bool,
+        #[arg(
+            long,
+            help = "Only refresh local metadata cache (branch parents, PR data)"
+        )]
+        metadata_only: bool,
     },
     #[command(about = "Rebase branches on parents")]
     Restack {
         #[arg(long, help = "Restack all branches")]
         all: bool,
+        #[arg(long, help = "Continue after resolving rebase conflicts")]
+        r#continue: bool,
+    },
+    #[command(about = "Repair branch topology using PR data as source of truth")]
+    Repair {
+        #[arg(
+            long,
+            help = "Check only — show what would be repaired without making changes"
+        )]
+        check: bool,
         #[arg(long, help = "Continue after resolving rebase conflicts")]
         r#continue: bool,
     },
@@ -118,13 +130,15 @@ async fn main() {
         Commands::Auth { command } => auth::run(command).await,
         Commands::Create { name } => branch::run(name.as_deref()).await,
         Commands::Stack => commands::stack::run().await,
-        Commands::Submit { all } => submit::run(all).await,
+        Commands::Submit => submit::run().await,
         Commands::Sync {
             no_restack,
             force,
             r#continue,
-        } => sync::run(no_restack, force, r#continue).await,
+            metadata_only,
+        } => sync::run(no_restack, force, r#continue, metadata_only).await,
         Commands::Restack { all, r#continue } => restack::run(all, r#continue).await,
+        Commands::Repair { check, r#continue } => repair::run(check, r#continue).await,
         Commands::Up => navigate::up().await,
         Commands::Down => navigate::down().await,
         Commands::Top => navigate::top().await,

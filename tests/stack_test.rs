@@ -220,6 +220,193 @@ async fn test_orphan_branch_falls_back_to_main() {
     );
 }
 
+// ── PR base_ref overrides merge-base parent (critical for stacked PRs) ───────
+//
+// After a rebase the merge-base heuristic often puts every branch directly
+// under main.  The PR base_ref is the source of truth and must override
+// the merge-base parent so the stack renders correctly.
+
+#[tokio::test]
+async fn test_pr_base_ref_overrides_merge_base_parent() {
+    let (dir, _repo) = create_test_repo();
+    let p = dir.path();
+
+    // Build main → A → B → C (linear stack)
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+
+    // Simulate a rebase that makes all branches look like direct children of
+    // main from a merge-base perspective: rebase A onto main's tip, then B
+    // onto A, etc.  After this the merge-base heuristic correctly links them,
+    // but to simulate the broken case we manually set up a parent_map where
+    // the merge-base puts B and C under main (which happens in large repos
+    // after rebase --onto when the merge-base shifts).
+    git(p, &["checkout", "A"]);
+    let repo = stax::git::GitRepo::open(p).unwrap();
+
+    let branches = repo.get_branches().unwrap();
+    let mut commits = std::collections::HashMap::new();
+    for b in &branches {
+        if let Ok(hash) = repo.get_commit_hash(&format!("refs/heads/{b}")) {
+            commits.insert(b.clone(), hash);
+        }
+    }
+    let merged = std::collections::HashSet::new();
+
+    // Intentionally wrong parent_map (simulates merge-base after rebase)
+    let mut parent_map: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    parent_map.insert("main".to_string(), None);
+    parent_map.insert("A".to_string(), Some("main".to_string()));
+    parent_map.insert("B".to_string(), Some("main".to_string())); // WRONG — should be A
+    parent_map.insert("C".to_string(), Some("main".to_string())); // WRONG — should be B
+
+    // Build stack WITHOUT PR overrides — all three branches are under main
+    let stack_no_prs = stax::stack::Stack::from_parent_map(
+        &repo,
+        "A",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        stack_no_prs.branches.get("B").unwrap().parent.as_deref(),
+        Some("main"),
+        "without PR overrides, merge-base parent should be used"
+    );
+    assert_eq!(
+        stack_no_prs.branches.get("C").unwrap().parent.as_deref(),
+        Some("main"),
+        "without PR overrides, merge-base parent should be used"
+    );
+
+    // Now apply PR base_ref overrides (simulates cached PR data)
+    parent_map.insert("B".to_string(), Some("A".to_string())); // PR says B → A
+    parent_map.insert("C".to_string(), Some("B".to_string())); // PR says C → B
+
+    let stack_with_prs = stax::stack::Stack::from_parent_map(
+        &repo,
+        "A",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    // With PR overrides the stack should be correctly linked: main → A → B → C
+    assert_eq!(
+        stack_with_prs.branches.get("A").unwrap().parent.as_deref(),
+        Some("main"),
+    );
+    assert_eq!(
+        stack_with_prs.branches.get("B").unwrap().parent.as_deref(),
+        Some("A"),
+        "PR base_ref must override merge-base parent"
+    );
+    assert_eq!(
+        stack_with_prs.branches.get("C").unwrap().parent.as_deref(),
+        Some("B"),
+        "PR base_ref must override merge-base parent"
+    );
+
+    // Children should reflect the corrected parents
+    let main_children = &stack_with_prs.branches.get("main").unwrap().children;
+    assert!(
+        main_children.contains(&"A".to_string()),
+        "main should have A as child"
+    );
+    assert!(
+        !main_children.contains(&"B".to_string()),
+        "main should NOT have B as child when PR says B → A"
+    );
+    assert!(
+        !main_children.contains(&"C".to_string()),
+        "main should NOT have C as child when PR says C → B"
+    );
+
+    let a_children = &stack_with_prs.branches.get("A").unwrap().children;
+    assert!(
+        a_children.contains(&"B".to_string()),
+        "A should have B as child"
+    );
+
+    let b_children = &stack_with_prs.branches.get("B").unwrap().children;
+    assert!(
+        b_children.contains(&"C".to_string()),
+        "B should have C as child"
+    );
+}
+
+#[tokio::test]
+async fn test_cached_prs_override_parent_map_for_full_stack_scope() {
+    // Tests the full flow: when get_stack_for_branch is called on the bottom
+    // branch, the entire chain should be included — not just the current
+    // branch + main (which is what happens when merge-base is wrong).
+    let (dir, _repo) = create_test_repo();
+    let p = dir.path();
+
+    // main → A → B → C → D → E
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+    create_branch_with_commit(p, "D", "C");
+    create_branch_with_commit(p, "E", "D");
+    git(p, &["checkout", "A"]);
+
+    let repo = stax::git::GitRepo::open(p).unwrap();
+    let branches = repo.get_branches().unwrap();
+    let mut commits = std::collections::HashMap::new();
+    for b in &branches {
+        if let Ok(hash) = repo.get_commit_hash(&format!("refs/heads/{b}")) {
+            commits.insert(b.clone(), hash);
+        }
+    }
+    let merged = std::collections::HashSet::new();
+
+    // Parent map with PR-corrected chain
+    let mut parent_map: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    parent_map.insert("main".to_string(), None);
+    parent_map.insert("A".to_string(), Some("main".to_string()));
+    parent_map.insert("B".to_string(), Some("A".to_string()));
+    parent_map.insert("C".to_string(), Some("B".to_string()));
+    parent_map.insert("D".to_string(), Some("C".to_string()));
+    parent_map.insert("E".to_string(), Some("D".to_string()));
+
+    let stack = stax::stack::Stack::from_parent_map(
+        &repo,
+        "A",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    // get_stack_for_branch from A should include the entire chain
+    let scope = stack.get_stack_for_branch("A");
+    let names: Vec<&str> = scope.iter().map(|b| b.name.as_str()).collect();
+
+    assert!(names.contains(&"main"), "scope should include main");
+    assert!(names.contains(&"A"), "scope should include A");
+    assert!(names.contains(&"B"), "scope should include B");
+    assert!(names.contains(&"C"), "scope should include C");
+    assert!(names.contains(&"D"), "scope should include D");
+    assert!(names.contains(&"E"), "scope should include E");
+    assert_eq!(names.len(), 6, "scope should contain exactly 6 branches");
+}
+
 // ── from_parent_map matches analyze_for_branch ──────────────────────────────
 
 #[tokio::test]

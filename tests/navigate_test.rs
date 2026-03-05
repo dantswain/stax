@@ -1,7 +1,7 @@
 mod common;
 
 use common::{add_commit, create_branch_with_commit, create_test_repo, git};
-use stax::cache::StackCache;
+use stax::cache::{CachedPullRequest, StackCache};
 use stax::commands::navigate::{
     build_commit_cache, build_parent_map, children_from_map, find_children, find_parent,
     get_branches_and_parent_map, get_branches_with_cache, is_active_stack, is_main_branch,
@@ -1112,4 +1112,436 @@ fn test_cache_stale_parent_triggers_child_recompute() {
     // branch point (A advanced without restacking B)
     assert_eq!(pm2.get("B").unwrap().as_deref(), Some("main"));
     assert_eq!(pm2.get("C").unwrap().as_deref(), Some("B"));
+}
+
+// ── PR base_ref overrides in get_branches_and_parent_map ─────────────────────
+//
+// These tests verify the critical behavior that PR base_ref overrides are
+// applied by get_branches_and_parent_map(), ensuring all consumers (navigate
+// commands, `stax stack`) see the same parent-child structure.
+
+/// Helper: write PR data into the cache for the given branches.
+fn write_pr_cache(repo: &stax::git::GitRepo, prs: Vec<(&str, &str, u64)>) {
+    let mut cache = StackCache::new(&repo.git_dir());
+    let mut pr_map = HashMap::new();
+    for (head, base, number) in prs {
+        pr_map.insert(
+            head.to_string(),
+            CachedPullRequest {
+                number,
+                state: "open".to_string(),
+                head_ref: head.to_string(),
+                base_ref: base.to_string(),
+                html_url: format!("https://github.com/o/r/pull/{number}"),
+                draft: false,
+            },
+        );
+    }
+    cache.save_pull_requests(&pr_map);
+}
+
+#[test]
+fn test_pr_override_corrects_parent_in_navigate() {
+    // After rebasing, merge-base may incorrectly assign B→main and C→main.
+    // PR base_ref data (B→A, C→B) should override this so navigate commands
+    // see the correct stack: main → A → B → C.
+    //
+    // This is the CRITICAL test for consistent behavior between `stax stack`
+    // and navigate commands like `stax top`.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+
+    // First call: populate the cache with correct merge-base parents
+    let (_b, _c, _m, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm1.get("A").unwrap().as_deref(), Some("main"));
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("A"));
+    assert_eq!(pm1.get("C").unwrap().as_deref(), Some("B"));
+
+    // Now simulate what happens after rebase: advance A so that merge-base
+    // of B and A no longer equals A's tip (B would fall back to main).
+    git(p, &["checkout", "A"]);
+    add_commit(p, "A_rebase.txt", "simulated rebase on A");
+
+    // Without PR overrides, B and C would get wrong parents.
+    // Write PR data that says B→A, C→B.
+    write_pr_cache(&repo, vec![("B", "A", 10), ("C", "B", 11)]);
+
+    // Second call: cache detects A as stale, recomputes B and C parents.
+    // Merge-base would put B→main, but PR override corrects to B→A.
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(
+        pm2.get("B").unwrap().as_deref(),
+        Some("A"),
+        "PR override should correct B's parent to A (not main)"
+    );
+    assert_eq!(
+        pm2.get("C").unwrap().as_deref(),
+        Some("B"),
+        "PR override should keep C's parent as B"
+    );
+}
+
+#[test]
+fn test_pr_override_on_cache_full_hit() {
+    // Even on a full cache hit (no stale branches), PR overrides should
+    // be applied.  This tests the fast path.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "main"); // B off main, not A
+
+    // First call: cold cache.  Merge-base correctly identifies B→main.
+    let (_b, _c, _m, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("main"));
+
+    // Now write a PR that says B's base is A (user retargeted the PR).
+    write_pr_cache(&repo, vec![("B", "A", 42)]);
+
+    // Second call: full cache hit (no tips changed).
+    // PR override should correct B→A.
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(
+        pm2.get("B").unwrap().as_deref(),
+        Some("A"),
+        "PR override should correct B's parent to A on full cache hit"
+    );
+}
+
+#[test]
+fn test_pr_override_walk_to_top_sees_correct_chain() {
+    // Verify that walk_to_top works correctly when PR overrides change
+    // the parent chain.  This directly tests the `stax top` behavior.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "main"); // B off main (not A)
+    create_branch_with_commit(p, "C", "main"); // C off main (not B)
+
+    // First call: merge-base puts all three off main.
+    let (_b, _c, _m, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm1.get("A").unwrap().as_deref(), Some("main"));
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("main"));
+    assert_eq!(pm1.get("C").unwrap().as_deref(), Some("main"));
+    // walk_to_top from A would stop at A (no children in this structure)
+    assert_eq!(walk_to_top("A", &pm1, &HashSet::new()), "A");
+
+    // Write PR data that forms a chain: A→main, B→A, C→B
+    write_pr_cache(&repo, vec![("A", "main", 1), ("B", "A", 2), ("C", "B", 3)]);
+
+    // Second call: full cache hit with PR overrides.
+    let (_b2, _c2, merged2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+
+    // Parent chain should now be: main → A → B → C
+    assert_eq!(pm2.get("A").unwrap().as_deref(), Some("main"));
+    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("A"));
+    assert_eq!(pm2.get("C").unwrap().as_deref(), Some("B"));
+
+    // walk_to_top from A should now reach C
+    assert_eq!(
+        walk_to_top("A", &pm2, &merged2),
+        "C",
+        "walk_to_top should follow PR-corrected chain A → B → C"
+    );
+
+    // children_from_map should also reflect the corrected structure
+    assert_eq!(children_from_map("A", &pm2, &merged2), vec!["B"]);
+    assert_eq!(children_from_map("B", &pm2, &merged2), vec!["C"]);
+    assert!(children_from_map("C", &pm2, &merged2).is_empty());
+
+    // root_children should be just A
+    assert_eq!(
+        root_children_from_map("main", &pm2, &merged2),
+        vec!["A"],
+        "only A should be a root child of main after PR overrides"
+    );
+}
+
+#[test]
+fn test_pr_override_children_from_map_reflects_override() {
+    // After PR overrides, children_from_map should return children
+    // based on the corrected parents, not the merge-base parents.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "main");
+
+    // First call: both off main
+    let (_b, _c, _m, _pm) = get_branches_and_parent_map(&repo).unwrap();
+
+    // PR says B's parent is A
+    write_pr_cache(&repo, vec![("B", "A", 10)]);
+
+    let (_b2, _c2, merged, pm2) = get_branches_and_parent_map(&repo).unwrap();
+
+    // A should have B as child
+    assert_eq!(
+        children_from_map("A", &pm2, &merged),
+        vec!["B"],
+        "A should have B as child after PR override"
+    );
+    // main should only have A as root child (B moved under A)
+    assert_eq!(
+        root_children_from_map("main", &pm2, &merged),
+        vec!["A"],
+        "main should only have A as root child after B moved under A"
+    );
+}
+
+#[test]
+fn test_pr_override_does_not_apply_for_unknown_base() {
+    // If a PR's base_ref doesn't exist as a branch, the override should
+    // be silently skipped (the branch was likely deleted).
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+
+    // First call: populate cache
+    let (_b, _c, _m, _pm) = get_branches_and_parent_map(&repo).unwrap();
+
+    // Write a PR pointing to a non-existent base branch
+    write_pr_cache(&repo, vec![("A", "nonexistent-branch", 99)]);
+
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+
+    // A's parent should still be main (override skipped because base doesn't exist)
+    assert_eq!(
+        pm2.get("A").unwrap().as_deref(),
+        Some("main"),
+        "override should be skipped when base_ref doesn't exist as a branch"
+    );
+}
+
+#[test]
+fn test_pr_override_on_cache_miss_with_existing_pr_data() {
+    // Even on a cache miss (e.g. corrupt cache file), if PR data somehow
+    // exists, it should still apply.  In practice, a true miss means no
+    // PR data, but this tests the code path robustness.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "main");
+
+    // Cold cache: no file exists. PR data can't be written without a cache
+    // file, so this call populates the branch cache.
+    let (_b, _c, _m, pm1) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(pm1.get("B").unwrap().as_deref(), Some("main"));
+
+    // Write PR data
+    write_pr_cache(&repo, vec![("B", "A", 5)]);
+
+    // Corrupt the branch data so it looks like a miss, but PR data survives.
+    // Actually, a real cache miss means the file doesn't exist or is corrupt,
+    // so there's no PR data to apply.  Instead, test the partial hit path
+    // by creating a new branch to trigger partial recompute.
+    create_branch_with_commit(p, "C", "main");
+
+    let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
+    assert_eq!(
+        pm2.get("B").unwrap().as_deref(),
+        Some("A"),
+        "PR override should apply even on partial cache hit"
+    );
+}
+
+// ── Stack::from_parent_map consistency ─────────────────────────────────────
+//
+// These tests verify that Stack::from_parent_map (used by status, restack,
+// sync) produces the same parent-child relationships as get_branches_and_parent_map
+// (used by navigate commands). This ensures all commands see the same stack.
+
+#[tokio::test]
+async fn test_from_parent_map_uses_same_parents_as_navigate() {
+    // Build a stack: main → A → B → C
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+    git(p, &["checkout", "C"]);
+
+    // Get parent map from navigate (the source of truth)
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+
+    // Build stack using from_parent_map (used by status, restack, sync)
+    let stack = stax::stack::Stack::from_parent_map(
+        &repo,
+        "C",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    // Verify stack matches parent map
+    assert_eq!(
+        stack.branches.get("A").unwrap().parent.as_deref(),
+        Some("main")
+    );
+    assert_eq!(
+        stack.branches.get("B").unwrap().parent.as_deref(),
+        Some("A")
+    );
+    assert_eq!(
+        stack.branches.get("C").unwrap().parent.as_deref(),
+        Some("B")
+    );
+
+    // Verify children
+    assert!(stack
+        .branches
+        .get("A")
+        .unwrap()
+        .children
+        .contains(&"B".to_string()));
+    assert!(stack
+        .branches
+        .get("B")
+        .unwrap()
+        .children
+        .contains(&"C".to_string()));
+}
+
+#[tokio::test]
+async fn test_from_parent_map_respects_pr_overrides() {
+    // When PR data says B→A but merge-base says B→main,
+    // Stack::from_parent_map should respect the PR override.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "main"); // B is off main, not A
+    git(p, &["checkout", "B"]);
+
+    // Cold cache: populate it
+    let _ = get_branches_and_parent_map(&repo).unwrap();
+
+    // Write PR data: B→A
+    write_pr_cache(&repo, vec![("B", "A", 1)]);
+
+    // Now get the parent map with PR override applied
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+
+    // Navigate sees B→A (overridden by PR)
+    assert_eq!(parent_map.get("B").unwrap().as_deref(), Some("A"));
+
+    // Build stack from the same parent map — should see the same thing
+    let stack = stax::stack::Stack::from_parent_map(
+        &repo,
+        "B",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        stack.branches.get("B").unwrap().parent.as_deref(),
+        Some("A"),
+        "Stack::from_parent_map should see PR-overridden parent"
+    );
+    assert!(
+        stack
+            .branches
+            .get("A")
+            .unwrap()
+            .children
+            .contains(&"B".to_string()),
+        "A should list B as a child after PR override"
+    );
+}
+
+#[tokio::test]
+async fn test_from_parent_map_fork_topology() {
+    // Verify fork topology: main → A → B, A → C
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "A");
+    git(p, &["checkout", "A"]);
+
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+
+    let stack = stax::stack::Stack::from_parent_map(
+        &repo,
+        "A",
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await
+    .unwrap();
+
+    // A should have 2 children: B and C
+    let a_children = &stack.branches.get("A").unwrap().children;
+    assert!(a_children.contains(&"B".to_string()));
+    assert!(a_children.contains(&"C".to_string()));
+    assert_eq!(a_children.len(), 2);
+
+    // B and C both have A as parent
+    assert_eq!(
+        stack.branches.get("B").unwrap().parent.as_deref(),
+        Some("A")
+    );
+    assert_eq!(
+        stack.branches.get("C").unwrap().parent.as_deref(),
+        Some("A")
+    );
+}
+
+#[test]
+fn test_cache_updated_after_get_branches_and_parent_map() {
+    // Verify the cache file is written after calling get_branches_and_parent_map,
+    // which is what restack, sync, and status rely on for persistence.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    let cache_path = repo.git_dir().join("stax").join("cache.json");
+    assert!(!cache_path.exists(), "cache should not exist yet");
+
+    let _ = get_branches_and_parent_map(&repo).unwrap();
+
+    assert!(
+        cache_path.exists(),
+        "cache should be written after first call"
+    );
+
+    // Verify cache content is valid
+    let mut cache = StackCache::new(&repo.git_dir());
+    let data = cache.load().expect("cache should be loadable");
+    assert!(
+        data.branches.contains_key("A"),
+        "cache should contain branch A"
+    );
+    assert!(
+        data.branches.contains_key("B"),
+        "cache should contain branch B"
+    );
+    assert_eq!(
+        data.branches.get("A").unwrap().parent.as_deref(),
+        Some("main")
+    );
+    assert_eq!(data.branches.get("B").unwrap().parent.as_deref(), Some("A"));
 }

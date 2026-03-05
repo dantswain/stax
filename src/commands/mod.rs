@@ -3,6 +3,7 @@ pub mod branch;
 pub mod config;
 pub mod log;
 pub mod navigate;
+pub mod repair;
 pub mod restack;
 pub mod stack;
 pub mod status;

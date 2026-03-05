@@ -289,7 +289,7 @@ impl GitRepo {
     /// If `old_onto_commit` is provided, uses `--onto` to only replay commits
     /// after the old parent tip (avoids re-applying parent's commits).
     pub fn rebase_onto(&self, branch: &str, onto: &str) -> Result<()> {
-        self.rebase_onto_with_base(branch, onto, None)
+        self.rebase_onto_with_base(branch, onto, None, None)
     }
 
     pub fn rebase_onto_with_base(
@@ -297,6 +297,7 @@ impl GitRepo {
         branch: &str,
         onto: &str,
         old_onto_commit: Option<&str>,
+        continue_command: Option<&str>,
     ) -> Result<()> {
         log::debug!(
             "Rebasing '{}' onto '{}' (old_base={:?})",
@@ -343,14 +344,16 @@ impl GitRepo {
         }
 
         // Leave the rebase in progress so the user can resolve conflicts
+        let hint = continue_command.unwrap_or("stax sync --continue");
         Err(anyhow!(
             "Rebase of '{}' onto '{}' hit conflicts.\n\
              Resolve conflicts, stage the files, then run:\n  \
-             stax sync --continue\n\
+             {}\n\
              To abort instead:\n  \
              git rebase --abort",
             branch,
-            onto
+            onto,
+            hint
         ))
     }
 

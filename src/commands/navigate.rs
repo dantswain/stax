@@ -665,11 +665,55 @@ pub fn get_branches_with_cache(
     Ok((all, commits, merged))
 }
 
+/// Apply PR base_ref overrides to the parent map.
+///
+/// When a branch has a cached PR, the PR's `base_ref` is the authoritative
+/// parent (the user set it explicitly when creating the PR).  This ensures
+/// navigate commands and `stax stack` always agree on the stack structure.
+fn apply_pr_overrides(
+    parent_map: &mut HashMap<String, Option<String>>,
+    cache: &StackCache,
+    all_branches: &[String],
+) {
+    let prs = match cache.data_ref() {
+        Some(data) => &data.pull_requests,
+        None => return,
+    };
+    if prs.is_empty() {
+        return;
+    }
+    let branch_set: HashSet<&str> = all_branches.iter().map(|s| s.as_str()).collect();
+    let mut count = 0u32;
+    for pr in prs.values() {
+        if parent_map.contains_key(&pr.head_ref) && branch_set.contains(pr.base_ref.as_str()) {
+            let current = parent_map.get(&pr.head_ref).and_then(|p| p.as_ref());
+            if current != Some(&pr.base_ref) {
+                log::debug!(
+                    "cache: PR #{} overrides parent of '{}': {:?} → '{}'",
+                    pr.number,
+                    pr.head_ref,
+                    current,
+                    pr.base_ref
+                );
+                parent_map.insert(pr.head_ref.clone(), Some(pr.base_ref.clone()));
+                count += 1;
+            }
+        }
+    }
+    if count > 0 {
+        log::debug!("cache: applied {} PR base_ref overrides", count);
+    }
+}
+
 /// Load branches, commit hashes, merged status, and parent map.
 ///
 /// Uses a local cache (`.git/stax/cache.json`) when all branch tips match,
 /// falling back to full recomputation on any cache miss or error.  On a full
 /// or partial recompute the cache is updated for next time.
+///
+/// PR `base_ref` overrides are applied to the parent map so that all
+/// consumers (navigate commands, `stax stack`, etc.) see a consistent view
+/// of the stack structure.
 #[allow(clippy::type_complexity)]
 pub fn get_branches_and_parent_map(
     git: &GitRepo,
@@ -703,8 +747,9 @@ pub fn get_branches_and_parent_map(
                 // === FULL CACHE HIT ===
                 log::debug!("cache: full hit, skipping recompute");
                 let data = cache.data_ref().unwrap();
-                let parent_map = StackCache::to_parent_map(data);
+                let mut parent_map = StackCache::to_parent_map(data);
                 let merged = StackCache::to_merged_set(data);
+                apply_pr_overrides(&mut parent_map, &cache, &all);
                 return Ok((all, commits, merged, parent_map));
             }
 
@@ -765,15 +810,14 @@ pub fn get_branches_and_parent_map(
                 }
             }
 
-            // Save updated cache
+            // Apply PR overrides before saving — the saved cache should
+            // reflect the authoritative parent relationships.
+            apply_pr_overrides(&mut parent_map, &cache, &all);
+
+            // Save updated cache (preserves existing PR data)
             let trunk_tip = commits.get(&trunk_name).cloned().unwrap_or_default();
-            let data = StackCache::build_cache_data(
-                &trunk_name,
-                &trunk_tip,
-                &parent_map,
-                &commits,
-                &merged,
-            );
+            let data =
+                cache.build_cache_data(&trunk_name, &trunk_tip, &parent_map, &commits, &merged);
             cache.save(&data);
 
             return Ok((all, commits, merged, parent_map));
@@ -783,12 +827,14 @@ pub fn get_branches_and_parent_map(
     // === CACHE MISS ===
     log::debug!("cache: miss, full recompute ({} branches)", all.len());
     let merged = compute_merged_set(git, &all, &commits)?;
-    let parent_map = build_parent_map(git, &all, &commits, &merged)?;
+    let mut parent_map = build_parent_map(git, &all, &commits, &merged)?;
 
-    // Save for next time
+    // Apply PR overrides (cache may still have PR data even on branch miss)
+    apply_pr_overrides(&mut parent_map, &cache, &all);
+
+    // Save for next time (preserves existing PR data)
     let trunk_tip = commits.get(&trunk_name).cloned().unwrap_or_default();
-    let data =
-        StackCache::build_cache_data(&trunk_name, &trunk_tip, &parent_map, &commits, &merged);
+    let data = cache.build_cache_data(&trunk_name, &trunk_tip, &parent_map, &commits, &merged);
     cache.save(&data);
 
     Ok((all, commits, merged, parent_map))

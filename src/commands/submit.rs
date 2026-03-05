@@ -1,4 +1,6 @@
 use crate::{
+    cache::{CachedPullRequest, StackCache},
+    commands::navigate::get_branches_and_parent_map,
     config::Config,
     git::GitRepo,
     github::{GitHubClient, PullRequest},
@@ -7,10 +9,11 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input};
+use std::collections::HashMap;
 
 const STACK_COMMENT_MARKER: &str = "<!-- stax-stack-comment -->";
 
-pub async fn run(all: bool) -> Result<()> {
+pub async fn run() -> Result<()> {
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
 
@@ -29,20 +32,14 @@ pub async fn run(all: bool) -> Result<()> {
 
     let github = GitHubClient::new(&token, &remote_url)?;
 
-    log::debug!("Analyzing stack structure");
+    log::debug!("Building stack from cache + PR metadata");
 
-    let stack = Stack::analyze(&git, Some(&github)).await?;
+    let stack = build_stack_from_metadata(&git, &github).await?;
 
-    if all {
-        log::debug!("Submitting all branches in stack...");
-        submit_stack(&git, &github, &stack, &config).await
-    } else {
-        log::debug!("Submitting current branch...");
-        submit_current_branch(&git, &github, &stack, &config).await
-    }
+    submit_branches(&git, &github, &stack, &config).await
 }
 
-async fn submit_current_branch(
+async fn submit_branches(
     git: &GitRepo,
     github: &GitHubClient,
     stack: &Stack,
@@ -58,7 +55,57 @@ async fn submit_current_branch(
         ));
     }
 
-    // Collect ancestor branches (parent-first) that don't have PRs yet
+    let stack_branches = stack.get_stack_for_branch(current_branch);
+
+    // Push and update all branches in the stack (not just the current one)
+    let mut stack = stack.clone();
+    for branch in &stack_branches {
+        if main_branches.contains(&branch.name.as_str()) {
+            continue;
+        }
+
+        push_branch(git, config, &branch.name)?;
+
+        if let Some(existing_pr) = &branch.pull_request {
+            // Update base branch if it has drifted
+            let expected_base = branch
+                .parent
+                .as_ref()
+                .unwrap_or(&config.default_base_branch);
+
+            if existing_pr.base_ref != *expected_base {
+                utils::print_info(&format!(
+                    "Updating PR #{} base: '{}' → '{}'",
+                    existing_pr.number, existing_pr.base_ref, expected_base
+                ));
+                github
+                    .update_pull_request(existing_pr.number, None, None, Some(expected_base))
+                    .await?;
+
+                let mut cache = StackCache::new(&git.git_dir());
+                if let Ok(tip) = git.get_commit_hash(&format!("refs/heads/{}", branch.name)) {
+                    cache.upsert_branch(&branch.name, &tip, Some(expected_base));
+                }
+            }
+
+            utils::print_success(&format!("Updated PR: {}", existing_pr.html_url));
+        }
+    }
+
+    // Now handle PR creation for the current branch (if it doesn't have one)
+    let current_stack_branch = stack
+        .branches
+        .get(current_branch)
+        .ok_or_else(|| anyhow!("Current branch not found in stack"))?;
+
+    if current_stack_branch.pull_request.is_some() {
+        // All PRs exist and were pushed/updated above — just update stack comments
+        let fresh_stack = build_stack_from_metadata(git, github).await?;
+        update_stack_comments(github, &fresh_stack).await?;
+        return Ok(());
+    }
+
+    // Current branch needs a new PR — check if ancestors also need PRs first
     let mut ancestors_without_prs: Vec<String> = Vec::new();
     let mut cur = current_branch.as_str();
     while let Some(branch) = stack.branches.get(cur) {
@@ -77,8 +124,6 @@ async fn submit_current_branch(
     }
     ancestors_without_prs.reverse(); // parent-first order
 
-    // If there are parent branches without PRs, ask the user before proceeding
-    let mut stack = stack.clone();
     if !ancestors_without_prs.is_empty() {
         utils::print_info("The following parent branches don't have PRs yet:");
         for name in &ancestors_without_prs {
@@ -100,77 +145,88 @@ async fn submit_current_branch(
         for name in &ancestors_without_prs {
             utils::print_info(&format!("Submitting PR for '{name}'..."));
             create_new_pr(git, github, name, &stack, config).await?;
-            // Re-analyze after each PR so the next branch sees the updated state
-            stack = Stack::analyze(git, Some(github)).await?;
+            stack = build_stack_from_metadata(git, github).await?;
         }
-    }
-
-    let current_stack_branch = stack
-        .branches
-        .get(current_branch)
-        .ok_or_else(|| anyhow!("Current branch not found in stack"))?;
-
-    // Push branch to remote (force-push if diverged after rebase)
-    push_branch(git, config, current_branch)?;
-
-    // If PR already exists, just push and update stack comments
-    if let Some(existing_pr) = &current_stack_branch.pull_request {
-        utils::print_success(&format!("Updated PR: {}", existing_pr.html_url));
-
-        let fresh_stack = Stack::analyze(git, Some(github)).await?;
-        update_stack_comments(github, &fresh_stack).await?;
-
-        return Ok(());
     }
 
     create_new_pr(git, github, current_branch, &stack, config).await?;
 
-    // Re-analyze to pick up newly created PR, then update stack comments
-    let fresh_stack = Stack::analyze(git, Some(github)).await?;
+    // Rebuild to pick up newly created PR, then update stack comments
+    let fresh_stack = build_stack_from_metadata(git, github).await?;
     update_stack_comments(github, &fresh_stack).await?;
 
     Ok(())
 }
 
-async fn submit_stack(
-    git: &GitRepo,
-    github: &GitHubClient,
-    stack: &Stack,
-    config: &Config,
-) -> Result<()> {
-    let current_branch = &stack.current_branch;
-    let stack_branches = stack.get_stack_for_branch(current_branch);
+/// Build a Stack using cache + PR base_ref overrides (same approach as `stax stack`).
+/// This is the single source of truth for parent relationships.
+async fn build_stack_from_metadata(git: &GitRepo, github: &GitHubClient) -> Result<Stack> {
+    let current_branch = git.current_branch()?;
+    // get_branches_and_parent_map() applies cached PR overrides automatically.
+    // We then fetch LIVE PR data to override any stale cached relationships.
+    let (branches, commits, merged, mut parent_map) = get_branches_and_parent_map(git)?;
 
-    // Filter out main branches and branches that already have PRs
-    let branches_to_submit: Vec<_> = stack_branches
-        .iter()
-        .filter(|b| {
-            !["main", "master", "develop"].contains(&b.name.as_str()) && b.pull_request.is_none()
-        })
-        .collect();
+    // Fetch live PRs — their base_ref is the most authoritative parent source,
+    // superseding both merge-base heuristics and cached PR data.
+    let mut prs: HashMap<String, PullRequest> = HashMap::new();
+    if let Ok(open_prs) = github.get_open_pull_requests().await {
+        for pr in open_prs {
+            if parent_map.contains_key(&pr.head_ref) && branches.contains(&pr.base_ref) {
+                let current = parent_map.get(&pr.head_ref).and_then(|p| p.as_ref());
+                if current != Some(&pr.base_ref) {
+                    log::debug!(
+                        "submit: live PR #{} overrides parent of '{}': {:?} → '{}'",
+                        pr.number,
+                        pr.head_ref,
+                        current,
+                        pr.base_ref
+                    );
+                    parent_map.insert(pr.head_ref.clone(), Some(pr.base_ref.clone()));
+                }
+            }
+            prs.insert(pr.head_ref.clone(), pr);
+        }
 
-    if branches_to_submit.is_empty() {
-        utils::print_info("All branches in stack already have PRs");
-        return Ok(());
+        // Persist live PR metadata to cache so other commands use fresh data
+        let cached_prs: HashMap<String, CachedPullRequest> = prs
+            .iter()
+            .map(|(k, pr)| {
+                (
+                    k.clone(),
+                    CachedPullRequest {
+                        number: pr.number,
+                        state: pr.state.clone(),
+                        head_ref: pr.head_ref.clone(),
+                        base_ref: pr.base_ref.clone(),
+                        html_url: pr.html_url.clone(),
+                        draft: pr.draft,
+                    },
+                )
+            })
+            .collect();
+        let mut cache = StackCache::new(&git.git_dir());
+        cache.save_pull_requests(&cached_prs);
     }
 
-    utils::print_info(&format!(
-        "Creating PRs for {} branches...",
-        branches_to_submit.len()
-    ));
+    let mut stack = Stack::from_parent_map(
+        git,
+        &current_branch,
+        None,
+        &branches,
+        &commits,
+        &merged,
+        &parent_map,
+    )
+    .await?;
 
-    for branch in branches_to_submit {
-        utils::print_info(&format!("Creating PR for branch: {}", branch.name));
-        create_new_pr(git, github, &branch.name, stack, config).await?;
+    // Inject PR data into the stack
+    for (head_ref, pr) in &prs {
+        if let Some(branch) = stack.branches.get_mut(head_ref) {
+            branch.pull_request = Some(pr.clone());
+        }
     }
 
-    utils::print_success("Stack submission completed!");
-
-    // Re-analyze to pick up newly created PRs, then update stack comments
-    let fresh_stack = Stack::analyze(git, Some(github)).await?;
-    update_stack_comments(github, &fresh_stack).await?;
-
-    Ok(())
+    Ok(stack)
 }
 
 /// Push a branch to remote, force-pushing with lease if it has diverged (e.g. after rebase).
@@ -284,6 +340,12 @@ async fn create_new_pr(
     let pr = github
         .create_pull_request(&title, &body, branch_name, base_branch, config.draft_prs)
         .await?;
+
+    // Update cache so the branch's parent matches the PR's base_ref
+    let mut cache = StackCache::new(&git.git_dir());
+    if let Ok(tip) = git.get_commit_hash(&format!("refs/heads/{branch_name}")) {
+        cache.upsert_branch(branch_name, &tip, Some(base_branch));
+    }
 
     utils::print_success(&format!("PR created: {}", pr.html_url));
 

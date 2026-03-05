@@ -1,3 +1,4 @@
+use crate::cache::StackCache;
 use crate::git::GitRepo;
 use crate::utils;
 use anyhow::Result;
@@ -33,6 +34,12 @@ pub async fn run(name: Option<&str>) -> Result<()> {
 
     git.create_branch(&branch_name, Some(&format!("refs/heads/{current_branch}")))?;
     git.checkout_branch(&branch_name)?;
+
+    // Update cache with the new branch and its known parent
+    let mut cache = StackCache::new(&git.git_dir());
+    if let Ok(tip) = git.get_commit_hash(&format!("refs/heads/{branch_name}")) {
+        cache.upsert_branch(&branch_name, &tip, Some(&current_branch));
+    }
 
     utils::print_success(&format!("Created and switched to branch '{branch_name}'"));
     utils::print_info(&format!("Parent branch: {current_branch}"));

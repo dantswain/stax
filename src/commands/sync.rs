@@ -1,18 +1,36 @@
 use crate::{
-    config::Config, git::GitRepo, github::GitHubClient, stack, stack::Stack, token_store, utils,
+    cache::{CachedPullRequest, RestackState, StackCache},
+    commands::navigate::get_branches_and_parent_map,
+    config::Config,
+    git::GitRepo,
+    github::{GitHubClient, PullRequest},
+    stack,
+    stack::Stack,
+    token_store, utils,
 };
 use anyhow::{anyhow, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result<()> {
+pub async fn run(
+    no_restack: bool,
+    force: bool,
+    continue_rebase: bool,
+    metadata_only: bool,
+) -> Result<()> {
     log::debug!(
-        "sync: no_restack={}, force={}, continue={}",
+        "sync: no_restack={}, force={}, continue={}, metadata_only={}",
         no_restack,
         force,
-        continue_rebase
+        continue_rebase,
+        metadata_only
     );
     let git = GitRepo::open(".")?;
     let config = Config::load()?;
+
+    if metadata_only {
+        log::debug!("sync: metadata-only mode");
+        return refresh_metadata(&git).await;
+    }
 
     if continue_rebase {
         log::debug!("sync: continuing after conflicts");
@@ -56,8 +74,8 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
         .ok_or_else(|| anyhow!("No 'origin' remote found."))?;
     let github = GitHubClient::new(&token, &remote_url)?;
 
-    // 5. Analyze stack to find merged/closed PRs (scoped to the current stack)
-    let stack = Stack::analyze(&git, Some(&github)).await?;
+    // 5. Build stack from cache + live PRs to find merged/closed PRs
+    let stack = build_stack_with_live_prs(&git, &github, &original_branch).await?;
     let current_stack: HashSet<String> = stack
         .get_stack_for_branch(&original_branch)
         .iter()
@@ -66,7 +84,7 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
     let mut merged = find_merged_branches(&stack, trunk, &current_stack);
 
     // Also check if the current branch is locally merged into trunk but was
-    // filtered out of Stack::analyze (its tip is an ancestor of trunk).
+    // filtered out of the stack (its tip is an ancestor of trunk).
     let locally_merged =
         find_locally_merged_branch(&git, &github, &stack, trunk, &original_branch).await;
     merged.extend(locally_merged);
@@ -101,7 +119,57 @@ pub async fn run(no_restack: bool, force: bool, continue_rebase: bool) -> Result
         git.checkout_branch(checkout_target)?;
     }
 
+    // Refresh cache to reflect all changes (deletions, rebases, trunk fast-forward)
+    log::debug!("sync: refreshing cache");
+    let _ = get_branches_and_parent_map(&git);
+
     utils::print_success("Sync complete");
+    Ok(())
+}
+
+/// Refresh the local metadata cache without fetching, rebasing, or deleting anything.
+/// Recomputes branch parent relationships and fetches fresh PR data from GitHub.
+async fn refresh_metadata(git: &GitRepo) -> Result<()> {
+    utils::print_info("Refreshing metadata cache...");
+
+    // 1. Recompute branch parents (triggers cache load → validate → partial recompute → save)
+    let _ = get_branches_and_parent_map(git)?;
+    log::debug!("sync: branch parent cache refreshed");
+
+    // 2. Fetch fresh PR data from GitHub and persist to cache
+    if let Some(token) = token_store::get_token() {
+        if let Some(remote_url) = git.get_remote_url("origin") {
+            if let Ok(github) = GitHubClient::new(&token, &remote_url) {
+                if let Ok(open_prs) = github.get_open_pull_requests().await {
+                    let cached_prs: HashMap<String, CachedPullRequest> = open_prs
+                        .iter()
+                        .map(|pr| {
+                            (
+                                pr.head_ref.clone(),
+                                CachedPullRequest {
+                                    number: pr.number,
+                                    state: pr.state.clone(),
+                                    head_ref: pr.head_ref.clone(),
+                                    base_ref: pr.base_ref.clone(),
+                                    html_url: pr.html_url.clone(),
+                                    draft: pr.draft,
+                                },
+                            )
+                        })
+                        .collect();
+
+                    let mut cache = StackCache::new(&git.git_dir());
+                    cache.save_pull_requests(&cached_prs);
+                    log::debug!("sync: saved {} PRs to cache", cached_prs.len());
+
+                    // Re-run parent computation so PR overrides take effect
+                    let _ = get_branches_and_parent_map(git)?;
+                }
+            }
+        }
+    }
+
+    utils::print_success("Metadata cache refreshed");
     Ok(())
 }
 
@@ -137,7 +205,7 @@ fn find_merged_branches(
 }
 
 /// Check if the current branch is locally merged into trunk but was filtered
-/// out of Stack::analyze(). If so, verify via GitHub that its PR is merged/closed.
+/// out of the stack. If so, verify via GitHub that its PR is merged/closed.
 async fn find_locally_merged_branch(
     git: &GitRepo,
     github: &GitHubClient,
@@ -229,6 +297,8 @@ async fn restack_branches(
     github: &GitHubClient,
     original_branch: &str,
 ) -> Result<()> {
+    // Fresh start — clear any stale restack state from a previous aborted run
+    StackCache::new(&git.git_dir()).clear_restack_state();
     restack_all(git, Some(github), original_branch).await
 }
 
@@ -236,16 +306,47 @@ async fn restack_branches(
 /// Only restacks branches in the same stack as `current_branch`.
 async fn restack_all(
     git: &GitRepo,
-    github: Option<&GitHubClient>,
+    _github: Option<&GitHubClient>,
     current_branch: &str,
 ) -> Result<()> {
-    let stack = Stack::analyze(git, github).await?;
+    let (branches, commits, merged_set, parent_map) = get_branches_and_parent_map(git)?;
+    let stack = Stack::from_parent_map(
+        git,
+        current_branch,
+        None,
+        &branches,
+        &commits,
+        &merged_set,
+        &parent_map,
+    )
+    .await?;
     let main_branches = ["main", "master", "develop"];
 
-    // Scope to only the current branch and its descendants (not ancestors).
-    // Rebasing ancestor branches is their own concern.
+    // Scope: walk up from current_branch to trunk to collect ancestors,
+    // then walk down from the topmost ancestor to collect all descendants.
+    // This ensures the full chain from trunk → current_branch (and beyond)
+    // is rebased in the correct topological order.
     let mut restack_scope: HashSet<String> = HashSet::new();
-    let mut queue = vec![current_branch.to_string()];
+
+    // 1. Walk up to find the topmost non-main ancestor
+    let mut top = current_branch.to_string();
+    {
+        let mut cur = current_branch.to_string();
+        while let Some(branch) = stack.branches.get(&cur) {
+            if let Some(parent) = &branch.parent {
+                if main_branches.contains(&parent.as_str()) {
+                    break;
+                }
+                top = parent.clone();
+                cur = parent.clone();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 2. Walk down from the top to collect the full scope
+    let mut queue = vec![top];
     while let Some(name) = queue.pop() {
         if restack_scope.insert(name.clone()) {
             if let Some(branch) = stack.branches.get(&name) {
@@ -280,19 +381,43 @@ async fn restack_all(
         return Ok(());
     }
 
-    // Snapshot ALL branch tips BEFORE any rebasing.
-    // When rebasing B onto A, we use A's OLD tip as the --onto base so that
-    // only B's own commits get replayed (not A's original commits).
-    let mut old_tips: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (branch, parent, _) in &to_rebase {
-        for name in [branch, parent] {
-            if !old_tips.contains_key(name) {
-                if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
-                    old_tips.insert(name.clone(), hash);
+    let cache = StackCache::new(&git.git_dir());
+
+    // Load persisted old_tips (from a previous --continue) or compute fresh.
+    // Persisted entries take precedence — they capture the original pre-restack
+    // fork points. Fresh entries fill in branches not in the original plan.
+    let old_tips = {
+        let persisted = cache.load_restack_state();
+        let mut tips = persisted.map(|s| s.old_tips).unwrap_or_default();
+        let had_persisted = !tips.is_empty();
+        for (branch, parent, _) in &to_rebase {
+            for name in [branch, parent] {
+                if !tips.contains_key(name) {
+                    if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
+                        tips.insert(name.clone(), hash);
+                    }
                 }
             }
         }
-    }
+        if had_persisted {
+            log::debug!(
+                "sync restack: loaded persisted old_tips, merged to {} entries",
+                tips.len()
+            );
+        } else {
+            log::debug!(
+                "sync restack: computed fresh old_tips ({} entries)",
+                tips.len()
+            );
+        }
+        tips
+    };
+
+    // Persist for potential --continue
+    cache.save_restack_state(&RestackState {
+        old_tips: old_tips.clone(),
+        original_branch: current_branch.to_string(),
+    });
 
     let mut restacked = Vec::new();
 
@@ -300,11 +425,19 @@ async fn restack_all(
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
         // Use the parent's pre-rebase tip so --onto only replays branch's own commits
         let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
-        match git.rebase_onto_with_base(branch, parent, old_parent_tip) {
+        match git.rebase_onto_with_base(
+            branch,
+            parent,
+            old_parent_tip,
+            Some("stax sync --continue"),
+        ) {
             Ok(()) => restacked.push(branch.as_str()),
             Err(e) => return Err(e),
         }
     }
+
+    // Success — clean up state file
+    cache.clear_restack_state();
 
     for branch in &restacked {
         utils::print_success(&format!("Restacked '{branch}'"));
@@ -325,8 +458,109 @@ async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()>
     // Re-analyze and restack remaining branches (scoped to current stack)
     let current_branch = git.current_branch()?;
     restack_all(git, None, &current_branch).await?;
+
+    // Refresh cache after conflict resolution and restacking
+    log::debug!("sync: refreshing cache after --continue");
+    let _ = get_branches_and_parent_map(git);
+
     utils::print_success("Sync complete");
     Ok(())
+}
+
+/// Build a Stack using the cache-aware path with live PR data from GitHub.
+/// Fetches fresh PR data (including merged/closed PRs) and persists it to cache.
+async fn build_stack_with_live_prs(
+    git: &GitRepo,
+    github: &GitHubClient,
+    current_branch: &str,
+) -> Result<Stack> {
+    let (branches, commits, merged_set, mut parent_map) = get_branches_and_parent_map(git)?;
+
+    // Fetch live PRs (including merged/closed state) for branch cleanup decisions
+    let mut prs: HashMap<String, PullRequest> = HashMap::new();
+    if let Ok(open_prs) = github.get_open_pull_requests().await {
+        for pr in open_prs {
+            // Apply live PR base_ref overrides (supersedes cached data)
+            if parent_map.contains_key(&pr.head_ref) && branches.contains(&pr.base_ref) {
+                let current = parent_map.get(&pr.head_ref).and_then(|p| p.as_ref());
+                if current != Some(&pr.base_ref) {
+                    log::debug!(
+                        "sync: live PR #{} overrides parent of '{}': {:?} → '{}'",
+                        pr.number,
+                        pr.head_ref,
+                        current,
+                        pr.base_ref
+                    );
+                    parent_map.insert(pr.head_ref.clone(), Some(pr.base_ref.clone()));
+                }
+            }
+            prs.insert(pr.head_ref.clone(), pr);
+        }
+
+        // Persist live PR metadata to cache
+        let cached_prs: HashMap<String, CachedPullRequest> = prs
+            .iter()
+            .map(|(k, pr)| {
+                (
+                    k.clone(),
+                    CachedPullRequest {
+                        number: pr.number,
+                        state: pr.state.clone(),
+                        head_ref: pr.head_ref.clone(),
+                        base_ref: pr.base_ref.clone(),
+                        html_url: pr.html_url.clone(),
+                        draft: pr.draft,
+                    },
+                )
+            })
+            .collect();
+        let mut cache = StackCache::new(&git.git_dir());
+        cache.save_pull_requests(&cached_prs);
+    }
+
+    // Also fetch PRs for branches that might be merged/closed (not in open PRs)
+    // by checking individually for branches not yet covered
+    let missing: Vec<_> = branches
+        .iter()
+        .filter(|b| !["main", "master", "develop"].contains(&b.as_str()) && !prs.contains_key(*b))
+        .cloned()
+        .collect();
+
+    if !missing.is_empty() {
+        let handles: Vec<_> = missing
+            .into_iter()
+            .map(|b| {
+                let gh = github.clone();
+                tokio::spawn(async move { gh.get_pr_for_branch(&b).await })
+            })
+            .collect();
+
+        for handle in handles {
+            if let Ok(Some(pr)) = handle.await? {
+                prs.insert(pr.head_ref.clone(), pr);
+            }
+        }
+    }
+
+    let mut stack = Stack::from_parent_map(
+        git,
+        current_branch,
+        None,
+        &branches,
+        &commits,
+        &merged_set,
+        &parent_map,
+    )
+    .await?;
+
+    // Inject PR data for merged/closed detection
+    for pr in prs.values() {
+        if let Some(branch) = stack.branches.get_mut(&pr.head_ref) {
+            branch.pull_request = Some(pr.clone());
+        }
+    }
+
+    Ok(stack)
 }
 
 /// Compute the depth of a branch in the stack (distance from root).
