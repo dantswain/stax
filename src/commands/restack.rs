@@ -42,6 +42,17 @@ async fn do_restack(git: &GitRepo, all: bool) -> Result<()> {
 
     let current_branch = git.current_branch()?;
     let (branches, commits, merged_set, parent_map) = get_branches_and_parent_map(git)?;
+
+    // Check for topology issues before restacking — restacking on a broken
+    // topology would cement the wrong parent relationships.
+    let mismatches = crate::commands::repair::check_topology_from_cache(git, &parent_map);
+    if !mismatches.is_empty() {
+        crate::utils::print_topology_warning(&mismatches);
+        return Err(anyhow!(
+            "Topology issues detected. Run 'stax repair' first, then restack."
+        ));
+    }
+
     let stack = Stack::from_parent_map(
         git,
         &current_branch,

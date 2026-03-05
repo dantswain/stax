@@ -19,6 +19,24 @@ pub fn print_warning(msg: &str) {
     println!("{} {}", "⚠".yellow().bold(), msg);
 }
 
+/// Print a topology warning with details about mismatched branches.
+/// Each entry is (branch_name, current_parent, expected_parent).
+pub fn print_topology_warning(mismatches: &[(String, String, String)]) {
+    print_warning(&format!(
+        "{} branch(es) have incorrect topology. Run '{}' to fix.",
+        mismatches.len(),
+        "stax repair".bold()
+    ));
+    for (branch, current, expected) in mismatches {
+        println!(
+            "    '{}': on '{}', should be on '{}'",
+            branch.bold(),
+            current.yellow(),
+            expected.green()
+        );
+    }
+}
+
 pub fn confirm(msg: &str) -> Result<bool> {
     print!("{} {} (y/N): ", "?".cyan().bold(), msg);
     io::stdout().flush()?;

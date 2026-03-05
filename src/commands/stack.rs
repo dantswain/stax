@@ -4,6 +4,7 @@ use crate::git::GitRepo;
 use crate::github::{GitHubClient, PullRequest};
 use crate::stack::Stack;
 use crate::token_store;
+use crate::utils;
 use anyhow::Result;
 use colored::*;
 use std::collections::{HashMap, HashSet};
@@ -95,6 +96,14 @@ pub async fn run() -> Result<()> {
         if let Some(branch) = stack.branches.get_mut(&pr.head_ref) {
             branch.pull_request = Some(pr.clone());
         }
+    }
+
+    // Check for topology issues
+    let mismatches = crate::commands::repair::check_topology_from_cache(&git, &parent_map);
+    if !mismatches.is_empty() {
+        println!();
+        utils::print_topology_warning(&mismatches);
+        println!();
     }
 
     // Scope to only the current branch's stack (ancestors + descendants)

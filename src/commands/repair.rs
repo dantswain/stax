@@ -21,17 +21,22 @@ pub async fn run(check: bool, continue_repair: bool) -> Result<()> {
             git.rebase_continue()?;
             utils::print_success("Rebase continued successfully");
         }
-        // State file is preserved — do_repair will load it
-        return do_repair(&git, false).await;
+        // State file is preserved — do_repair will load it.
+        // Load cached PRs (persisted by fetch_live_prs on the initial run).
+        let prs = load_cached_prs(&git)?;
+        return do_repair(&git, false, &prs).await;
     }
 
     // Fresh start — clear any stale state
     StackCache::new(&git.git_dir()).clear_restack_state();
 
-    do_repair(&git, check).await
+    let prs = fetch_live_prs(&git).await?;
+    do_repair(&git, check, &prs).await
 }
 
-async fn do_repair(git: &GitRepo, check: bool) -> Result<()> {
+/// Core repair logic.  Accepts pre-fetched PR data so that tests can
+/// supply synthetic PRs without hitting the GitHub API.
+pub async fn do_repair(git: &GitRepo, check: bool, prs: &[PullRequest]) -> Result<()> {
     if git.is_rebase_in_progress() {
         return Err(anyhow!(
             "A rebase is currently in progress.\n\
@@ -46,8 +51,6 @@ async fn do_repair(git: &GitRepo, check: bool) -> Result<()> {
 
     let current_branch = git.current_branch()?;
 
-    // Step 1: Fetch live PR data
-    let prs = fetch_live_prs(git).await?;
     if prs.is_empty() {
         utils::print_info("No open PRs found — nothing to repair");
         return Ok(());
@@ -223,6 +226,85 @@ async fn do_repair(git: &GitRepo, check: bool) -> Result<()> {
     Ok(())
 }
 
+/// Check cached PR data for topology mismatches without fetching from GitHub.
+/// Returns a list of (branch, current_parent, expected_parent) tuples.
+/// Used by other commands to warn users about broken topology.
+pub fn check_topology_from_cache(
+    git: &GitRepo,
+    parent_map: &HashMap<String, Option<String>>,
+) -> Vec<(String, String, String)> {
+    let mut cache = StackCache::new(&git.git_dir());
+    let cached_prs = match cache.load() {
+        Some(data) => data.pull_requests.clone(),
+        None => return Vec::new(),
+    };
+    if cached_prs.is_empty() {
+        return Vec::new();
+    }
+
+    let all_branches: Vec<String> = parent_map.keys().cloned().collect();
+    let branch_set: HashSet<&str> = all_branches.iter().map(|s| s.as_str()).collect();
+
+    // Convert cached PRs to PullRequest references for reuse of existing logic
+    let prs: Vec<PullRequest> = cached_prs
+        .values()
+        .filter(|cpr| cpr.state == "open")
+        .map(|cpr| PullRequest {
+            number: cpr.number,
+            title: String::new(),
+            body: None,
+            state: cpr.state.clone(),
+            head_ref: cpr.head_ref.clone(),
+            base_ref: cpr.base_ref.clone(),
+            html_url: cpr.html_url.clone(),
+            draft: cpr.draft,
+        })
+        .collect();
+
+    let local_prs: Vec<&PullRequest> = prs
+        .iter()
+        .filter(|pr| {
+            branch_set.contains(pr.head_ref.as_str()) && branch_set.contains(pr.base_ref.as_str())
+        })
+        .collect();
+
+    if local_prs.is_empty() {
+        return Vec::new();
+    }
+
+    // Build expected parents from PR chain (same logic as do_repair)
+    let mut expected_parents: HashMap<String, String> = HashMap::new();
+    for pr in &local_prs {
+        expected_parents.insert(pr.head_ref.clone(), pr.base_ref.clone());
+    }
+
+    // Infer gap branch parents (silently — no interactive prompts)
+    if let Ok(inferred) = infer_gap_branch_parents_silent(&local_prs, &branch_set) {
+        for (branch, parent) in inferred {
+            expected_parents.insert(branch, parent);
+        }
+    }
+
+    // Compare against current parent_map
+    let mut mismatches = Vec::new();
+    for (branch, expected_parent) in &expected_parents {
+        let current_parent = parent_map
+            .get(branch)
+            .and_then(|p| p.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        if current_parent != *expected_parent {
+            mismatches.push((branch.clone(), current_parent, expected_parent.clone()));
+        }
+    }
+
+    if !mismatches.is_empty() {
+        log::debug!("check_topology: found {} mismatch(es)", mismatches.len());
+    }
+
+    mismatches
+}
+
 /// Fetch live PRs from GitHub and persist to cache.
 async fn fetch_live_prs(git: &GitRepo) -> Result<Vec<PullRequest>> {
     let token = token_store::get_token()
@@ -259,12 +341,45 @@ async fn fetch_live_prs(git: &GitRepo) -> Result<Vec<PullRequest>> {
     Ok(prs)
 }
 
+/// Load cached PRs from disk (for --continue after a previous run persisted them).
+fn load_cached_prs(git: &GitRepo) -> Result<Vec<PullRequest>> {
+    let mut cache = StackCache::new(&git.git_dir());
+    let cached_prs = cache
+        .load()
+        .map(|data| data.pull_requests.clone())
+        .unwrap_or_default();
+
+    if cached_prs.is_empty() {
+        return Err(anyhow!(
+            "No cached PR data found. Run 'stax repair' (without --continue) to fetch fresh data."
+        ));
+    }
+
+    let prs: Vec<PullRequest> = cached_prs
+        .values()
+        .filter(|cpr| cpr.state == "open")
+        .map(|cpr| PullRequest {
+            number: cpr.number,
+            title: String::new(),
+            body: None,
+            state: cpr.state.clone(),
+            head_ref: cpr.head_ref.clone(),
+            base_ref: cpr.base_ref.clone(),
+            html_url: cpr.html_url.clone(),
+            draft: cpr.draft,
+        })
+        .collect();
+
+    log::debug!("repair: loaded {} cached PRs for --continue", prs.len());
+    Ok(prs)
+}
+
 /// Infer parents for "gap branches" — branches that are used as PR bases
 /// but don't have PRs of their own.
 ///
 /// Uses PR chain topology: removes descendant tails to find the unique
 /// candidate parent. Falls back to FuzzySelect if ambiguous.
-fn infer_gap_branch_parents(
+pub(crate) fn infer_gap_branch_parents(
     prs: &[&PullRequest],
     branch_set: &HashSet<&str>,
 ) -> Result<HashMap<String, String>> {
@@ -356,8 +471,64 @@ fn infer_gap_branch_parents(
     Ok(result)
 }
 
+/// Silent version of `infer_gap_branch_parents` for use in `check_topology_from_cache`.
+/// Only returns single-candidate inferences (no interactive prompts, no warnings).
+fn infer_gap_branch_parents_silent(
+    prs: &[&PullRequest],
+    branch_set: &HashSet<&str>,
+) -> Result<HashMap<String, String>> {
+    let head_refs: HashSet<&str> = prs.iter().map(|pr| pr.head_ref.as_str()).collect();
+    let base_refs: HashSet<&str> = prs.iter().map(|pr| pr.base_ref.as_str()).collect();
+
+    let chain_tails: HashSet<&str> = head_refs
+        .iter()
+        .filter(|h| !base_refs.contains(*h))
+        .copied()
+        .collect();
+
+    let gap_branches: Vec<&str> = base_refs
+        .iter()
+        .filter(|b| {
+            !head_refs.contains(*b) && !MAIN_BRANCHES.contains(b) && branch_set.contains(*b)
+        })
+        .copied()
+        .collect();
+
+    if gap_branches.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let base_to_heads: HashMap<&str, Vec<&str>> = {
+        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
+        for pr in prs {
+            map.entry(pr.base_ref.as_str())
+                .or_default()
+                .push(pr.head_ref.as_str());
+        }
+        map
+    };
+
+    let mut result = HashMap::new();
+
+    for gap in &gap_branches {
+        let descendants = collect_descendants(gap, &base_to_heads);
+        let candidates: Vec<&str> = chain_tails
+            .iter()
+            .filter(|t| !descendants.contains(*t))
+            .copied()
+            .collect();
+
+        if candidates.len() == 1 {
+            result.insert(gap.to_string(), candidates[0].to_string());
+        }
+        // Skip 0 and multi-candidate cases silently
+    }
+
+    Ok(result)
+}
+
 /// Collect all transitive descendants of a branch in the PR chain.
-fn collect_descendants<'a>(
+pub(crate) fn collect_descendants<'a>(
     branch: &'a str,
     base_to_heads: &HashMap<&'a str, Vec<&'a str>>,
 ) -> HashSet<&'a str> {
@@ -377,7 +548,9 @@ fn collect_descendants<'a>(
 }
 
 /// Sort branches topologically so parents are repaired before children.
-fn topological_sort(expected_parents: &HashMap<String, String>) -> Vec<(String, String)> {
+pub(crate) fn topological_sort(
+    expected_parents: &HashMap<String, String>,
+) -> Vec<(String, String)> {
     let mut result = Vec::new();
     let mut visited = HashSet::new();
 
@@ -409,4 +582,155 @@ fn topological_sort(expected_parents: &HashMap<String, String>) -> Vec<(String, 
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::PullRequest;
+
+    fn make_pr(head: &str, base: &str, number: u64) -> PullRequest {
+        PullRequest {
+            number,
+            title: String::new(),
+            body: None,
+            state: "open".to_string(),
+            head_ref: head.to_string(),
+            base_ref: base.to_string(),
+            html_url: format!("https://github.com/o/r/pull/{number}"),
+            draft: false,
+        }
+    }
+
+    // ---- topological_sort tests ----
+
+    #[test]
+    fn test_topological_sort_linear_chain() {
+        // A→main, B→A, C→B → should produce [A, B, C]
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), "main".to_string());
+        map.insert("B".to_string(), "A".to_string());
+        map.insert("C".to_string(), "B".to_string());
+
+        let sorted = topological_sort(&map);
+        let names: Vec<&str> = sorted.iter().map(|(b, _)| b.as_str()).collect();
+
+        // A must come before B, B must come before C
+        let pos_a = names.iter().position(|&n| n == "A").unwrap();
+        let pos_b = names.iter().position(|&n| n == "B").unwrap();
+        let pos_c = names.iter().position(|&n| n == "C").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+    }
+
+    #[test]
+    fn test_topological_sort_independent_branches() {
+        // A→main, B→main — both appear, order doesn't matter
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), "main".to_string());
+        map.insert("B".to_string(), "main".to_string());
+
+        let sorted = topological_sort(&map);
+        assert_eq!(sorted.len(), 2);
+
+        let names: HashSet<&str> = sorted.iter().map(|(b, _)| b.as_str()).collect();
+        assert!(names.contains("A"));
+        assert!(names.contains("B"));
+    }
+
+    #[test]
+    fn test_topological_sort_diamond() {
+        // B→A, C→A, A→main — A must appear before B and C
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), "main".to_string());
+        map.insert("B".to_string(), "A".to_string());
+        map.insert("C".to_string(), "A".to_string());
+
+        let sorted = topological_sort(&map);
+        let names: Vec<&str> = sorted.iter().map(|(b, _)| b.as_str()).collect();
+
+        let pos_a = names.iter().position(|&n| n == "A").unwrap();
+        let pos_b = names.iter().position(|&n| n == "B").unwrap();
+        let pos_c = names.iter().position(|&n| n == "C").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_a < pos_c);
+    }
+
+    // ---- collect_descendants tests ----
+
+    #[test]
+    fn test_collect_descendants_linear() {
+        // A→B→C chain
+        let mut base_to_heads: HashMap<&str, Vec<&str>> = HashMap::new();
+        base_to_heads.insert("A", vec!["B"]);
+        base_to_heads.insert("B", vec!["C"]);
+
+        let desc = collect_descendants("A", &base_to_heads);
+        assert!(desc.contains("B"));
+        assert!(desc.contains("C"));
+        assert_eq!(desc.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_descendants_branching() {
+        // A→{B, C}
+        let mut base_to_heads: HashMap<&str, Vec<&str>> = HashMap::new();
+        base_to_heads.insert("A", vec!["B", "C"]);
+
+        let desc = collect_descendants("A", &base_to_heads);
+        assert!(desc.contains("B"));
+        assert!(desc.contains("C"));
+        assert_eq!(desc.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_descendants_no_children() {
+        // Leaf node with no children
+        let base_to_heads: HashMap<&str, Vec<&str>> = HashMap::new();
+
+        let desc = collect_descendants("leaf", &base_to_heads);
+        assert!(desc.is_empty());
+    }
+
+    // ---- infer_gap_branch_parents tests ----
+
+    #[test]
+    fn test_infer_gap_single_candidate() {
+        // PRs: tail→main, child→gap
+        // gap has no PR → gap's inferred parent = tail (sole chain tail not descended from gap)
+        let pr1 = make_pr("tail", "main", 1);
+        let pr2 = make_pr("child", "gap", 2);
+        let prs: Vec<&PullRequest> = vec![&pr1, &pr2];
+        let branch_set: HashSet<&str> = ["main", "tail", "gap", "child"].iter().copied().collect();
+
+        let result = infer_gap_branch_parents(&prs, &branch_set).unwrap();
+        assert_eq!(result.get("gap"), Some(&"tail".to_string()));
+    }
+
+    #[test]
+    fn test_infer_gap_no_candidates() {
+        // PRs: child→gap — tail IS a descendant of gap in the chain
+        // Actually: gap→child is the chain direction. gap is the base, child is the head.
+        // chain_tails = {child} (child is a head_ref not used as a base_ref)
+        // descendants of gap = {child}
+        // candidates = chain_tails - descendants = {} → no candidate
+        let pr1 = make_pr("child", "gap", 1);
+        let prs: Vec<&PullRequest> = vec![&pr1];
+        let branch_set: HashSet<&str> = ["main", "gap", "child"].iter().copied().collect();
+
+        let result = infer_gap_branch_parents(&prs, &branch_set).unwrap();
+        assert!(result.is_empty()); // No candidate found
+    }
+
+    #[test]
+    fn test_infer_gap_no_gaps() {
+        // All PR bases have their own PRs → no gap branches
+        let pr1 = make_pr("A", "main", 1);
+        let pr2 = make_pr("B", "A", 2);
+        let prs: Vec<&PullRequest> = vec![&pr1, &pr2];
+        let branch_set: HashSet<&str> = ["main", "A", "B"].iter().copied().collect();
+
+        let result = infer_gap_branch_parents(&prs, &branch_set).unwrap();
+        assert!(result.is_empty());
+    }
 }

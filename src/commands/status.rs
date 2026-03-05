@@ -101,6 +101,9 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Check for topology issues
+    let mismatches = crate::commands::repair::check_topology_from_cache(&git, &parent_map);
+
     println!("{}", "Repository Status".bold().underline());
     println!("Current branch: {}", stack.current_branch.green().bold());
 
@@ -123,6 +126,11 @@ pub async fn run() -> Result<()> {
                 current_branch.children.join(", ").cyan()
             );
         }
+    }
+
+    if !mismatches.is_empty() {
+        println!();
+        utils::print_topology_warning(&mismatches);
     }
 
     Ok(())
