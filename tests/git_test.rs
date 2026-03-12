@@ -284,6 +284,58 @@ fn test_ensure_tracking_branch_no_remote_fails() {
     assert!(result.is_err());
 }
 
+// ── has_diverged_from_remote / is_ahead_of_remote ───────────────────────────
+
+#[test]
+fn test_in_sync_with_remote() {
+    let (dir, _bare, _repo) = create_test_repo_with_remote();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "feature", "main");
+    git(p, &["push", "-u", "origin", "feature"]);
+    git(p, &["fetch", "origin"]);
+
+    let repo = stax::git::GitRepo::open(p).unwrap();
+    assert!(!repo.has_diverged_from_remote("feature").unwrap());
+    assert!(!repo.is_ahead_of_remote("feature").unwrap());
+}
+
+#[test]
+fn test_ahead_of_remote() {
+    let (dir, _bare, _repo) = create_test_repo_with_remote();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "feature", "main");
+    git(p, &["push", "-u", "origin", "feature"]);
+    git(p, &["fetch", "origin"]);
+
+    // Add a new commit locally without pushing
+    add_commit(p, "extra.txt", "extra content");
+
+    let repo = stax::git::GitRepo::open(p).unwrap();
+    assert!(!repo.has_diverged_from_remote("feature").unwrap());
+    assert!(repo.is_ahead_of_remote("feature").unwrap());
+}
+
+#[test]
+fn test_diverged_from_remote() {
+    let (dir, _bare, _repo) = create_test_repo_with_remote();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "feature", "main");
+    git(p, &["push", "-u", "origin", "feature"]);
+    git(p, &["fetch", "origin"]);
+
+    // Amend the commit to diverge from remote
+    std::fs::write(p.join("feature.txt"), "amended content").unwrap();
+    git(p, &["add", "feature.txt"]);
+    git(p, &["commit", "--amend", "-m", "amended feature"]);
+
+    let repo = stax::git::GitRepo::open(p).unwrap();
+    assert!(repo.has_diverged_from_remote("feature").unwrap());
+    assert!(!repo.is_ahead_of_remote("feature").unwrap());
+}
+
 #[test]
 fn test_get_remote_url() {
     let (_dir, bare, repo) = create_test_repo_with_remote();

@@ -214,6 +214,34 @@ impl GitRepo {
         Ok(true)
     }
 
+    /// Check if local branch is strictly ahead of its remote counterpart
+    /// (i.e., local has new commits that are fast-forward descendants of remote).
+    pub fn is_ahead_of_remote(&self, branch_name: &str) -> Result<bool> {
+        log::debug!("Checking if '{}' is ahead of remote", branch_name);
+        let local_ref = format!("refs/heads/{branch_name}");
+        let remote_ref = format!("refs/remotes/origin/{branch_name}");
+
+        let local_oid = match self.repo.find_reference(&local_ref) {
+            Ok(r) => r
+                .target()
+                .ok_or_else(|| anyhow!("No target for local ref"))?,
+            Err(_) => return Ok(false),
+        };
+        let remote_oid = match self.repo.find_reference(&remote_ref) {
+            Ok(r) => r
+                .target()
+                .ok_or_else(|| anyhow!("No target for remote ref"))?,
+            Err(_) => return Ok(false),
+        };
+
+        if local_oid == remote_oid {
+            return Ok(false);
+        }
+
+        // Local is ahead if it's a descendant of remote
+        Ok(self.repo.graph_descendant_of(local_oid, remote_oid)?)
+    }
+
     pub fn get_merge_base(&self, branch1: &str, branch2: &str) -> Result<Oid> {
         let commit1 = self.resolve_oid(branch1)?;
         let commit2 = self.resolve_oid(branch2)?;
