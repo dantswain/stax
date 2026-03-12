@@ -366,6 +366,55 @@ fn test_cache_merge_sources_serialization() {
     );
 }
 
+// ── ancestor detection (guard against unnecessary diamond merges) ────────────
+
+#[test]
+fn test_ancestor_detected_for_sibling_branches() {
+    // When A and B are both off main, main is an ancestor of B.
+    // The include guard should detect this.
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+
+    // main is ancestor of feat-b: merge-base(main, feat-b) == main's tip
+    let main_tip = repo.get_commit_hash("refs/heads/main").unwrap();
+    let merge_base = repo.get_merge_base("main", "feat-b").unwrap();
+    assert_eq!(
+        merge_base.to_string(),
+        main_tip,
+        "main should be an ancestor of feat-b"
+    );
+
+    // feat-a is NOT an ancestor of feat-b (they diverged from main)
+    let a_tip = repo.get_commit_hash("refs/heads/feat-a").unwrap();
+    let mb_ab = repo.get_merge_base("feat-a", "feat-b").unwrap();
+    assert_ne!(
+        mb_ab.to_string(),
+        a_tip,
+        "feat-a should NOT be an ancestor of feat-b"
+    );
+}
+
+#[test]
+fn test_ancestor_detected_for_stacked_branches() {
+    // When B is stacked on A, A is an ancestor of B.
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "feat-a");
+
+    let a_tip = repo.get_commit_hash("refs/heads/feat-a").unwrap();
+    let merge_base = repo.get_merge_base("feat-a", "feat-b").unwrap();
+    assert_eq!(
+        merge_base.to_string(),
+        a_tip,
+        "feat-a should be an ancestor of feat-b"
+    );
+}
+
 // ── build_parent_map skips shadow branches ──────────────────────────────────
 
 #[test]

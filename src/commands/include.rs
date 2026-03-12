@@ -96,6 +96,48 @@ pub async fn run(branch: Option<&str>, continue_merge: bool) -> Result<()> {
         s
     };
 
+    // Guard: if one source is an ancestor of another, a shadow merge is
+    // unnecessary — the user should just reparent. This catches the common
+    // mistake of `stax include B` when A and B are both off main (sources
+    // would be ["main", "B"], but main is an ancestor of B so the shadow
+    // would just be a redundant merge commit equivalent to B).
+    if sources.len() == 2 {
+        let a = &sources[0];
+        let b = &sources[1];
+        let a_is_ancestor = git
+            .get_merge_base(a, b)
+            .ok()
+            .map(|mb| {
+                mb.to_string()
+                    == git
+                        .get_commit_hash(&format!("refs/heads/{a}"))
+                        .unwrap_or_default()
+            })
+            .unwrap_or(false);
+        let b_is_ancestor = git
+            .get_merge_base(a, b)
+            .ok()
+            .map(|mb| {
+                mb.to_string()
+                    == git
+                        .get_commit_hash(&format!("refs/heads/{b}"))
+                        .unwrap_or_default()
+            })
+            .unwrap_or(false);
+        if a_is_ancestor || b_is_ancestor {
+            let (ancestor, descendant) = if a_is_ancestor { (a, b) } else { (b, a) };
+            return Err(anyhow!(
+                "'{branch}' already contains all commits from '{ancestor}', \
+                 so a diamond merge is unnecessary.\n\
+                 To make '{descendant}' the parent of '{consumer}' instead, \
+                 rebase onto it:\n  \
+                 git rebase {descendant}\n\
+                 Then update the PR base branch with:\n  \
+                 stax submit"
+            ));
+        }
+    }
+
     let shadow_name = StackCache::shadow_name_for(&consumer);
 
     utils::print_info(&format!(
