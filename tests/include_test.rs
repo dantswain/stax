@@ -443,3 +443,513 @@ fn test_build_parent_map_skips_shadows() {
         "shadow branch should not be in parent_map from build_parent_map"
     );
 }
+
+// ── nth-level diamond merge ─────────────────────────────────────────────────
+
+#[test]
+fn test_shadow_branch_at_nth_level() {
+    // main → A → B and main → C → D. Shadow merges C and B for D.
+    // This tests that shadow branches work when sources are deep in the tree.
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "a", "main");
+    create_branch_with_commit(path, "b", "a");
+    create_branch_with_commit(path, "c", "main");
+    create_branch_with_commit(path, "d", "c");
+
+    // Create shadow merging c and b (d's parent is c, so sources = [c, b])
+    repo.recreate_shadow_branch("stax/shadow/d", &["c", "b"])
+        .expect("should create shadow from nth-level branches");
+
+    // Verify shadow has content from both c and b
+    git(path, &["checkout", "stax/shadow/d"]);
+    assert!(path.join("c.txt").exists(), "should have c's content");
+    assert!(path.join("b.txt").exists(), "should have b's content");
+    // b is based on a, so a's content should also be reachable
+    assert!(path.join("a.txt").exists(), "should have a's content");
+}
+
+#[test]
+fn test_shadow_recreation_after_source_update() {
+    // Recreating shadow after a source branch gets new commits.
+    // Simulates what happens during restack.
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+    let tip1 = repo
+        .get_commit_hash("refs/heads/stax/shadow/consumer")
+        .unwrap();
+
+    // feat-a gets new commits (simulating restack moving it forward)
+    git(path, &["checkout", "feat-a"]);
+    add_commit(path, "feat-a-update.txt", "updated");
+
+    // Recreate shadow — should incorporate the new commit
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+    let tip2 = repo
+        .get_commit_hash("refs/heads/stax/shadow/consumer")
+        .unwrap();
+
+    assert_ne!(tip1, tip2, "shadow should have new tip after source update");
+
+    // Verify new content is present
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    assert!(path.join("feat-a-update.txt").exists());
+    assert!(path.join("feat-b.txt").exists());
+}
+
+#[test]
+fn test_dissolve_one_source_merged_rebases_consumer() {
+    // Bug 1 regression test: dissolution must rebase the consumer onto the
+    // remaining source.  Exercises the actual dissolve_shadows_if_needed
+    // function with real cache state.
+    use common::commit_is_ancestor;
+    use stax::cache::{CachedBranch, ShadowBranch, StackCache};
+
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+
+    // Build shadow and consumer
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    git(path, &["checkout", "-b", "consumer"]);
+    add_commit(path, "consumer.txt", "consumer work");
+    repo.rebase_onto("consumer", "stax/shadow/consumer")
+        .unwrap();
+    assert!(commit_is_ancestor(path, "stax/shadow/consumer", "consumer"));
+
+    // Set up cache exactly as `include` would
+    let git_dir = repo.git_dir();
+    let shadow_tip = repo
+        .get_commit_hash("refs/heads/stax/shadow/consumer")
+        .unwrap();
+    let consumer_tip = repo.get_commit_hash("refs/heads/consumer").unwrap();
+    let main_tip = repo.get_commit_hash("refs/heads/main").unwrap();
+
+    let data = stax::cache::CacheFile {
+        schema_version: 2,
+        trunk: stax::cache::TrunkInfo {
+            name: "main".to_string(),
+            tip: main_tip,
+            merged: Vec::new(),
+        },
+        branches: [
+            (
+                "feat-a".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/feat-a").unwrap(),
+                    parent: Some("main".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "feat-b".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/feat-b").unwrap(),
+                    parent: Some("main".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "stax/shadow/consumer".to_string(),
+                CachedBranch {
+                    tip: shadow_tip.clone(),
+                    parent: Some("feat-a".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "consumer".to_string(),
+                CachedBranch {
+                    tip: consumer_tip,
+                    parent: Some("stax/shadow/consumer".to_string()),
+                    merge_sources: vec!["feat-a".to_string(), "feat-b".to_string()],
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        pull_requests: HashMap::new(),
+        shadow_branches: [(
+            "stax/shadow/consumer".to_string(),
+            ShadowBranch {
+                consumer: "consumer".to_string(),
+                sources: vec!["feat-a".to_string(), "feat-b".to_string()],
+                tip: shadow_tip,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let cache = StackCache::new(&git_dir);
+    cache.save(&data);
+
+    // Simulate feat-b being merged — call dissolve_shadows_if_needed
+    let merged = vec![("feat-b".to_string(), "PR #2 merged".to_string())];
+    git(path, &["checkout", "consumer"]);
+    stax::commands::sync::dissolve_shadows_if_needed(&repo, &merged, "main").unwrap();
+
+    // Consumer should now be based on feat-a (the remaining source)
+    assert!(
+        commit_is_ancestor(path, "feat-a", "consumer"),
+        "consumer should be based on feat-a after dissolution"
+    );
+
+    // Shadow branch should be deleted
+    let branches = repo.get_branches().unwrap();
+    assert!(
+        !branches.contains(&"stax/shadow/consumer".to_string()),
+        "shadow branch should be deleted"
+    );
+
+    // Consumer's own work should survive
+    git(path, &["checkout", "consumer"]);
+    assert!(path.join("consumer.txt").exists());
+
+    // Cache should reflect the new parent
+    let mut cache2 = StackCache::new(&git_dir);
+    let loaded = cache2.load().unwrap();
+    assert_eq!(
+        loaded.branches["consumer"].parent,
+        Some("feat-a".to_string())
+    );
+    assert!(loaded.branches["consumer"].merge_sources.is_empty());
+    assert!(loaded.shadow_branches.is_empty());
+}
+
+#[test]
+fn test_dissolve_all_sources_merged_reparents_to_trunk() {
+    use common::commit_is_ancestor;
+    use stax::cache::{CachedBranch, ShadowBranch, StackCache};
+
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    git(path, &["checkout", "-b", "consumer"]);
+    add_commit(path, "consumer.txt", "consumer work");
+    repo.rebase_onto("consumer", "stax/shadow/consumer")
+        .unwrap();
+
+    // Set up cache
+    let git_dir = repo.git_dir();
+    let shadow_tip = repo
+        .get_commit_hash("refs/heads/stax/shadow/consumer")
+        .unwrap();
+    let data = stax::cache::CacheFile {
+        schema_version: 2,
+        trunk: stax::cache::TrunkInfo {
+            name: "main".to_string(),
+            tip: repo.get_commit_hash("refs/heads/main").unwrap(),
+            merged: Vec::new(),
+        },
+        branches: [
+            (
+                "stax/shadow/consumer".to_string(),
+                CachedBranch {
+                    tip: shadow_tip.clone(),
+                    parent: Some("feat-a".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "consumer".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/consumer").unwrap(),
+                    parent: Some("stax/shadow/consumer".to_string()),
+                    merge_sources: vec!["feat-a".to_string(), "feat-b".to_string()],
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        pull_requests: HashMap::new(),
+        shadow_branches: [(
+            "stax/shadow/consumer".to_string(),
+            ShadowBranch {
+                consumer: "consumer".to_string(),
+                sources: vec!["feat-a".to_string(), "feat-b".to_string()],
+                tip: shadow_tip,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let cache = StackCache::new(&git_dir);
+    cache.save(&data);
+
+    // Both sources merged
+    let merged = vec![
+        ("feat-a".to_string(), "PR #1 merged".to_string()),
+        ("feat-b".to_string(), "PR #2 merged".to_string()),
+    ];
+    git(path, &["checkout", "consumer"]);
+    stax::commands::sync::dissolve_shadows_if_needed(&repo, &merged, "main").unwrap();
+
+    // Consumer should be based on main (trunk)
+    assert!(commit_is_ancestor(path, "main", "consumer"));
+
+    // Cache should show consumer → main
+    let mut cache2 = StackCache::new(&git_dir);
+    let loaded = cache2.load().unwrap();
+    assert_eq!(loaded.branches["consumer"].parent, Some("main".to_string()));
+}
+
+#[test]
+fn test_dissolve_partial_recreates_shadow_with_remaining() {
+    use stax::cache::{CachedBranch, ShadowBranch, StackCache};
+
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+    create_branch_with_commit(path, "feat-c", "main");
+
+    // Shadow merges all three
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b", "feat-c"])
+        .unwrap();
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    git(path, &["checkout", "-b", "consumer"]);
+    add_commit(path, "consumer.txt", "consumer work");
+
+    let git_dir = repo.git_dir();
+    let shadow_tip = repo
+        .get_commit_hash("refs/heads/stax/shadow/consumer")
+        .unwrap();
+    let data = stax::cache::CacheFile {
+        schema_version: 2,
+        trunk: stax::cache::TrunkInfo {
+            name: "main".to_string(),
+            tip: repo.get_commit_hash("refs/heads/main").unwrap(),
+            merged: Vec::new(),
+        },
+        branches: [
+            (
+                "consumer".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/consumer").unwrap(),
+                    parent: Some("stax/shadow/consumer".to_string()),
+                    merge_sources: vec![
+                        "feat-a".to_string(),
+                        "feat-b".to_string(),
+                        "feat-c".to_string(),
+                    ],
+                },
+            ),
+            (
+                "stax/shadow/consumer".to_string(),
+                CachedBranch {
+                    tip: shadow_tip.clone(),
+                    parent: Some("feat-a".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        pull_requests: HashMap::new(),
+        shadow_branches: [(
+            "stax/shadow/consumer".to_string(),
+            ShadowBranch {
+                consumer: "consumer".to_string(),
+                sources: vec![
+                    "feat-a".to_string(),
+                    "feat-b".to_string(),
+                    "feat-c".to_string(),
+                ],
+                tip: shadow_tip,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let cache = StackCache::new(&git_dir);
+    cache.save(&data);
+
+    // Only feat-b merged — 2 sources remain, shadow should be recreated
+    let merged = vec![("feat-b".to_string(), "PR #2 merged".to_string())];
+    git(path, &["checkout", "consumer"]);
+    stax::commands::sync::dissolve_shadows_if_needed(&repo, &merged, "main").unwrap();
+
+    // Shadow should still exist with remaining sources
+    let branches = repo.get_branches().unwrap();
+    assert!(branches.contains(&"stax/shadow/consumer".to_string()));
+
+    // Shadow should have content from feat-a and feat-c
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    assert!(path.join("feat-a.txt").exists());
+    assert!(path.join("feat-c.txt").exists());
+
+    // Cache should reflect updated sources
+    let mut cache2 = StackCache::new(&git_dir);
+    let loaded = cache2.load().unwrap();
+    let shadow = &loaded.shadow_branches["stax/shadow/consumer"];
+    assert_eq!(shadow.sources, vec!["feat-a", "feat-c"]);
+    assert_eq!(
+        loaded.branches["consumer"].merge_sources,
+        vec!["feat-a", "feat-c"]
+    );
+}
+
+#[test]
+fn test_shadow_injected_into_parent_map() {
+    // Verify that get_branches_and_parent_map injects shadow entries from
+    // cache so the parent map shows consumer → shadow → first_source.
+    use stax::cache::{CachedBranch, ShadowBranch, StackCache};
+
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+
+    // Create the shadow branch and consumer in git
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    git(path, &["checkout", "-b", "consumer"]);
+    add_commit(path, "consumer.txt", "consumer work");
+    repo.rebase_onto("consumer", "stax/shadow/consumer")
+        .unwrap();
+
+    // Set up cache with shadow data
+    let git_dir = repo.git_dir();
+    let shadow_tip = repo
+        .get_commit_hash("refs/heads/stax/shadow/consumer")
+        .unwrap();
+    let data = stax::cache::CacheFile {
+        schema_version: 2,
+        trunk: stax::cache::TrunkInfo {
+            name: "main".to_string(),
+            tip: repo.get_commit_hash("refs/heads/main").unwrap(),
+            merged: Vec::new(),
+        },
+        branches: [
+            (
+                "feat-a".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/feat-a").unwrap(),
+                    parent: Some("main".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "feat-b".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/feat-b").unwrap(),
+                    parent: Some("main".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "stax/shadow/consumer".to_string(),
+                CachedBranch {
+                    tip: shadow_tip.clone(),
+                    parent: Some("feat-a".to_string()),
+                    merge_sources: Vec::new(),
+                },
+            ),
+            (
+                "consumer".to_string(),
+                CachedBranch {
+                    tip: repo.get_commit_hash("refs/heads/consumer").unwrap(),
+                    parent: Some("stax/shadow/consumer".to_string()),
+                    merge_sources: vec!["feat-a".to_string(), "feat-b".to_string()],
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        pull_requests: HashMap::new(),
+        shadow_branches: [(
+            "stax/shadow/consumer".to_string(),
+            ShadowBranch {
+                consumer: "consumer".to_string(),
+                sources: vec!["feat-a".to_string(), "feat-b".to_string()],
+                tip: shadow_tip,
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let cache = StackCache::new(&git_dir);
+    cache.save(&data);
+
+    // Now call get_branches_and_parent_map — it should inject shadow entries
+    let (_, _, _, parent_map) =
+        stax::commands::navigate::get_branches_and_parent_map(&repo).unwrap();
+
+    // Shadow should be in the parent map with first source as parent
+    assert_eq!(
+        parent_map.get("stax/shadow/consumer"),
+        Some(&Some("feat-a".to_string())),
+        "shadow's parent should be first source"
+    );
+    // Consumer's parent should be the shadow
+    assert_eq!(
+        parent_map.get("consumer"),
+        Some(&Some("stax/shadow/consumer".to_string())),
+        "consumer's parent should be the shadow"
+    );
+}
+
+#[test]
+fn test_restack_recreates_shadow_before_consumer() {
+    // When restacking, if a branch's parent is a shadow, the shadow must be
+    // recreated from its sources before the consumer is rebased onto it.
+    use common::commit_is_ancestor;
+
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    create_branch_with_commit(path, "feat-a", "main");
+    create_branch_with_commit(path, "feat-b", "main");
+
+    // Build shadow and consumer
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+
+    git(path, &["checkout", "stax/shadow/consumer"]);
+    git(path, &["checkout", "-b", "consumer"]);
+    add_commit(path, "consumer.txt", "consumer work");
+    repo.rebase_onto("consumer", "stax/shadow/consumer")
+        .unwrap();
+
+    // Now advance feat-a (simulating restack of feat-a)
+    git(path, &["checkout", "feat-a"]);
+    add_commit(path, "feat-a-v2.txt", "feat-a updated");
+
+    // Recreate shadow (this is what restack does before rebasing consumer)
+    repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"])
+        .unwrap();
+
+    // Now rebase consumer onto the new shadow
+    git(path, &["checkout", "consumer"]);
+    repo.rebase_onto("consumer", "stax/shadow/consumer")
+        .unwrap();
+
+    // Consumer should be based on the new shadow
+    assert!(commit_is_ancestor(path, "stax/shadow/consumer", "consumer"));
+
+    // Consumer should have access to feat-a's new content
+    git(path, &["checkout", "consumer"]);
+    assert!(path.join("feat-a-v2.txt").exists());
+    assert!(path.join("consumer.txt").exists());
+}

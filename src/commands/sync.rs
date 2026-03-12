@@ -645,7 +645,7 @@ async fn build_stack_with_live_prs(
 /// - All sources merged: delete shadow, reparent consumer to trunk.
 /// - Some sources merged: remove them from sources, recreate shadow or
 ///   dissolve to single parent.
-fn dissolve_shadows_if_needed(
+pub fn dissolve_shadows_if_needed(
     git: &GitRepo,
     merged_branches: &[(String, String)],
     trunk: &str,
@@ -688,7 +688,7 @@ fn dissolve_shadows_if_needed(
                 shadow_name, shadow.consumer, new_parent
             ));
 
-            // Delete shadow branch (local)
+            // Delete shadow branch (local + remote)
             if git
                 .get_commit_hash(&format!("refs/heads/{shadow_name}"))
                 .is_ok()
@@ -700,12 +700,27 @@ fn dissolve_shadows_if_needed(
                 let _ = git.delete_branch(shadow_name, true);
             }
 
+            // Rebase consumer onto new parent immediately.
+            // We must do this now (not defer to the later restack step) because
+            // the consumer is currently based on the shadow's merge commit.
+            // A `--onto` rebase later would use the wrong base and try to
+            // replay the merge commit.
+            utils::print_info(&format!(
+                "Rebasing '{}' onto '{}'",
+                shadow.consumer, new_parent
+            ));
+            git.rebase_onto(&shadow.consumer, new_parent)?;
+
             // Update cache: remove shadow entry, update consumer parent
             cache.remove_shadow(shadow_name);
+            let consumer_tip = git
+                .get_commit_hash(&format!("refs/heads/{}", shadow.consumer))
+                .unwrap_or_default();
             if let Some(data) = cache.data_mut() {
                 if let Some(branch) = data.branches.get_mut(&shadow.consumer) {
                     branch.parent = Some(new_parent.to_string());
                     branch.merge_sources.clear();
+                    branch.tip = consumer_tip;
                 }
                 data.branches.remove(shadow_name);
             }
