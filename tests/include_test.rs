@@ -60,7 +60,9 @@ fn test_recreate_shadow_branch_replaces_old() {
 }
 
 #[test]
-fn test_recreate_shadow_branch_conflict_aborts_cleanly() {
+fn test_recreate_shadow_branch_conflict_leaves_merge_in_progress() {
+    use stax::git::ShadowMergeConflict;
+
     let (dir, repo) = create_test_repo();
     let path = dir.path();
 
@@ -80,8 +82,94 @@ fn test_recreate_shadow_branch_conflict_aborts_cleanly() {
     let result = repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"]);
     assert!(result.is_err());
 
-    // Working tree should be clean (merge was aborted)
-    assert!(repo.is_clean().unwrap());
+    let err = result.unwrap_err();
+    let conflict = err.downcast_ref::<ShadowMergeConflict>().unwrap();
+    assert_eq!(conflict.shadow_name, "stax/shadow/consumer");
+    assert_eq!(conflict.failed_source, "feat-b");
+
+    // Merge should be in progress (not aborted)
+    assert!(repo.is_merge_in_progress());
+
+    // We should be on the shadow branch
+    assert_eq!(repo.current_branch().unwrap(), "stax/shadow/consumer");
+}
+
+#[test]
+fn test_shadow_merge_conflict_continue() {
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    // Create two branches that modify the same file
+    git(path, &["checkout", "-b", "feat-a"]);
+    std::fs::write(path.join("shared.txt"), "version a").unwrap();
+    git(path, &["add", "shared.txt"]);
+    git(path, &["commit", "-m", "add shared from a"]);
+
+    git(path, &["checkout", "main"]);
+    git(path, &["checkout", "-b", "feat-b"]);
+    std::fs::write(path.join("shared.txt"), "version b").unwrap();
+    git(path, &["add", "shared.txt"]);
+    git(path, &["commit", "-m", "add shared from b"]);
+
+    // Trigger conflict
+    let result = repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b"]);
+    assert!(result.is_err());
+    assert!(repo.is_merge_in_progress());
+
+    // Resolve the conflict manually
+    std::fs::write(path.join("shared.txt"), "resolved").unwrap();
+    git(path, &["add", "shared.txt"]);
+
+    // Continue the shadow merge (no remaining sources)
+    repo.continue_shadow_merge("stax/shadow/consumer", &[])
+        .expect("continue should succeed");
+
+    // Shadow should now have both branches' content
+    assert!(!repo.is_merge_in_progress());
+    let content = std::fs::read_to_string(path.join("shared.txt")).unwrap();
+    assert_eq!(content, "resolved");
+}
+
+#[test]
+fn test_shadow_merge_conflict_with_remaining_sources() {
+    use stax::git::ShadowMergeConflict;
+
+    let (dir, repo) = create_test_repo();
+    let path = dir.path();
+
+    // Create three branches: a, b conflict, c doesn't
+    git(path, &["checkout", "-b", "feat-a"]);
+    std::fs::write(path.join("shared.txt"), "version a").unwrap();
+    git(path, &["add", "shared.txt"]);
+    git(path, &["commit", "-m", "add shared from a"]);
+
+    git(path, &["checkout", "main"]);
+    git(path, &["checkout", "-b", "feat-b"]);
+    std::fs::write(path.join("shared.txt"), "version b").unwrap();
+    git(path, &["add", "shared.txt"]);
+    git(path, &["commit", "-m", "add shared from b"]);
+
+    git(path, &["checkout", "main"]);
+    git(path, &["checkout", "-b", "feat-c"]);
+    add_commit(path, "feat-c.txt", "feat c");
+
+    // Trigger conflict (feat-b conflicts with feat-a, feat-c is remaining)
+    let result =
+        repo.recreate_shadow_branch("stax/shadow/consumer", &["feat-a", "feat-b", "feat-c"]);
+    let err = result.unwrap_err();
+    let conflict = err.downcast_ref::<ShadowMergeConflict>().unwrap();
+    assert_eq!(conflict.failed_source, "feat-b");
+    assert_eq!(conflict.remaining_sources, vec!["feat-c"]);
+
+    // Resolve and continue
+    std::fs::write(path.join("shared.txt"), "resolved").unwrap();
+    git(path, &["add", "shared.txt"]);
+    repo.continue_shadow_merge("stax/shadow/consumer", &["feat-c"])
+        .expect("continue should succeed");
+
+    // Shadow should have all three branches' content
+    assert!(path.join("shared.txt").exists());
+    assert!(path.join("feat-c.txt").exists());
 }
 
 // ── is_shadow_branch ────────────────────────────────────────────────────────

@@ -64,7 +64,9 @@ enum Commands {
     #[command(about = "Include another branch as a merge dependency")]
     Include {
         #[arg(help = "Branch to include as a merge source")]
-        branch: String,
+        branch: Option<String>,
+        #[arg(long, help = "Continue after resolving merge conflicts")]
+        r#continue: bool,
     },
     #[command(about = "Move up the stack (away from main)")]
     Up,
@@ -144,7 +146,9 @@ async fn main() {
         } => sync::run(no_restack, force, r#continue, metadata_only).await,
         Commands::Restack { all, r#continue } => restack::run(all, r#continue).await,
         Commands::Repair { check, r#continue } => repair::run(check, r#continue).await,
-        Commands::Include { branch } => commands::include::run(&branch).await,
+        Commands::Include { branch, r#continue } => {
+            commands::include::run(branch.as_deref(), r#continue).await
+        }
         Commands::Up => navigate::up().await,
         Commands::Down => navigate::down().await,
         Commands::Top => navigate::top().await,

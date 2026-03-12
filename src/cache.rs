@@ -71,6 +71,25 @@ pub struct RestackState {
     pub original_branch: String,
 }
 
+/// Persisted state for a shadow branch merge that hit conflicts.
+/// Written when `recreate_shadow_branch` encounters a merge conflict,
+/// loaded by `--continue` to finish the merge and proceed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ShadowMergeState {
+    /// Name of the shadow branch being built (e.g. `stax/shadow/consumer`).
+    pub shadow_name: String,
+    /// The consumer branch that will be rebased onto the shadow.
+    pub consumer: String,
+    /// All sources for the shadow branch.
+    pub all_sources: Vec<String>,
+    /// Sources that still need to be merged (the first failed, rest are pending).
+    pub remaining_sources: Vec<String>,
+    /// The branch the user was on when the operation started.
+    pub original_branch: String,
+    /// Which command initiated this: "include", "restack", or "sync".
+    pub continue_command: String,
+}
+
 // ---------------------------------------------------------------------------
 // Validation result
 // ---------------------------------------------------------------------------
@@ -504,6 +523,74 @@ impl StackCache {
             Ok(()) => log::debug!("restack-state: cleared {}", path.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => log::debug!("restack-state: remove failed: {e}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shadow merge state persistence
+    // -----------------------------------------------------------------------
+
+    /// Path to the shadow merge state file (`.git/stax/shadow-merge-state.json`).
+    fn shadow_merge_state_path(&self) -> PathBuf {
+        self.cache_path
+            .parent()
+            .expect("cache_path has a parent")
+            .join("shadow-merge-state.json")
+    }
+
+    /// Persist shadow merge state to disk for `--continue` to pick up.
+    pub fn save_shadow_merge_state(&self, state: &ShadowMergeState) {
+        let path = self.shadow_merge_state_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::warn!("shadow-merge-state: failed to create directory: {e}");
+                return;
+            }
+        }
+        let json = match serde_json::to_string_pretty(state) {
+            Ok(j) => j,
+            Err(e) => {
+                log::warn!("shadow-merge-state: serialization failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = fs::write(&path, json) {
+            log::warn!("shadow-merge-state: save failed: {e}");
+        } else {
+            log::debug!("shadow-merge-state: saved to {}", path.display());
+        }
+    }
+
+    /// Load persisted shadow merge state.  Returns `None` on any failure.
+    pub fn load_shadow_merge_state(&self) -> Option<ShadowMergeState> {
+        let path = self.shadow_merge_state_path();
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                log::debug!("shadow-merge-state: read error: {e}");
+                return None;
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(state) => {
+                log::debug!("shadow-merge-state: loaded from {}", path.display());
+                Some(state)
+            }
+            Err(e) => {
+                log::debug!("shadow-merge-state: parse error: {e}");
+                None
+            }
+        }
+    }
+
+    /// Delete the shadow merge state file.
+    pub fn clear_shadow_merge_state(&self) {
+        let path = self.shadow_merge_state_path();
+        match fs::remove_file(&path) {
+            Ok(()) => log::debug!("shadow-merge-state: cleared {}", path.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::debug!("shadow-merge-state: remove failed: {e}"),
         }
     }
 

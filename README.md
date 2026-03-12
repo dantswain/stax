@@ -227,6 +227,9 @@ stax restack --continue
 # Include another branch as a merge dependency (diamond merge)
 stax include other-branch
 
+# Continue after resolving shadow merge conflicts
+stax include --continue
+
 # Check branch topology against PR data (dry run)
 stax repair --check
 
@@ -295,6 +298,25 @@ You can include multiple branches:
 ```bash
 $ stax include add-logging    # Now depends on add-auth, add-database, and add-logging
 ```
+
+**Handling merge conflicts:**
+
+If the source branches conflict with each other, `stax include` will leave the merge in progress for you to resolve:
+
+```bash
+$ stax include add-conflicting
+ℹ Creating shadow branch 'stax/shadow/add-payments' from ["add-auth", "add-conflicting"]
+Error: Merge conflict while building shadow branch 'stax/shadow/add-payments'.
+Source 'add-conflicting' conflicts with prior sources.
+
+Resolve the conflicts, stage the files, then run:
+  stax include --continue
+
+To abort instead:
+  git merge --abort && git checkout add-payments
+```
+
+After resolving the conflicts and staging the files, run `stax include --continue` to finish building the shadow branch. The same `--continue` flow works for shadow merge conflicts during `stax restack` and `stax sync`.
 
 **When a source branch is merged:**
 
@@ -405,7 +427,7 @@ cargo fmt
 
 ## Testing Coverage
 
-The project includes 221 tests across unit and integration suites:
+The project includes 223 tests across unit and integration suites:
 
 - **Unit Tests** (92 tests, in-module `#[cfg(test)]`):
   - `cache.rs` — Cache roundtrip, schema validation, restack state persistence, branch upsert, PR data, shadow branch helpers
@@ -418,10 +440,10 @@ The project includes 221 tests across unit and integration suites:
   - `utils.rs` — String truncation edge cases
   - `oauth.rs` — Client creation, request structure validation
 
-- **Integration Tests** (129 tests, `tests/`):
+- **Integration Tests** (131 tests, `tests/`):
   - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (26 tests using temp repos with bare remote origins)
   - `navigate_test.rs` — Parent detection, cache warm/cold/partial hits, PR overrides, topological walking, merged branch handling, fork detection (61 tests)
-  - `include_test.rs` — Shadow branch creation/replacement/conflict, is_shadow_branch, parent/children exclusion, children_from_map resolution, cache roundtrip, build_parent_map skipping (10 tests)
+  - `include_test.rs` — Shadow branch creation/replacement/conflict resolution/continue, is_shadow_branch, parent/children exclusion, children_from_map resolution, cache roundtrip, build_parent_map skipping (12 tests)
   - `stack_test.rs` — `Stack::analyze` and `Stack::from_parent_map` with various topologies: linear, branching, diamond, PR overrides (14 async tests)
   - `repair_test.rs` — Topology mismatch detection, gap branch inference, topological sorting (12 tests)
   - `restack_test.rs` — `rebase_onto` simple/noop/conflict/full-stack/branch-preservation (5 tests)

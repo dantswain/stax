@@ -438,7 +438,34 @@ async fn restack_all(
             if let Some(shadow) = shadow_branches.get(parent) {
                 utils::print_info(&format!("Recreating shadow branch '{parent}'"));
                 let source_refs: Vec<&str> = shadow.sources.iter().map(|s| s.as_str()).collect();
-                git.recreate_shadow_branch(parent, &source_refs)?;
+                match git.recreate_shadow_branch(parent, &source_refs) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if let Some(conflict) = e.downcast_ref::<crate::git::ShadowMergeConflict>()
+                        {
+                            shadow_cache.save_shadow_merge_state(&crate::cache::ShadowMergeState {
+                                shadow_name: conflict.shadow_name.clone(),
+                                consumer: shadow.consumer.clone(),
+                                all_sources: shadow.sources.clone(),
+                                remaining_sources: conflict.remaining_sources.clone(),
+                                original_branch: current_branch.to_string(),
+                                continue_command: "stax sync --continue".to_string(),
+                            });
+                            return Err(anyhow::anyhow!(
+                                "Merge conflict while rebuilding shadow branch '{}'.\n\
+                                 Source '{}' conflicts with prior sources.\n\n\
+                                 Resolve the conflicts, stage the files, then run:\n  \
+                                 stax sync --continue\n\n\
+                                 To abort instead:\n  \
+                                 git merge --abort && git checkout {}",
+                                conflict.shadow_name,
+                                conflict.failed_source,
+                                current_branch,
+                            ));
+                        }
+                        return Err(e);
+                    }
+                }
             }
         }
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
@@ -465,10 +492,41 @@ async fn restack_all(
     Ok(())
 }
 
-/// Continue a sync after the user has resolved rebase conflicts.
-/// Finishes the in-progress rebase, then restacks any remaining branches.
+/// Continue a sync after the user has resolved rebase or merge conflicts.
+/// Handles shadow merge conflicts, rebase conflicts, then restacks remaining.
 async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()> {
-    if git.is_rebase_in_progress() {
+    let cache = StackCache::new(&git.git_dir());
+
+    // Check if we're continuing a shadow merge conflict
+    if let Some(state) = cache.load_shadow_merge_state() {
+        if git.is_merge_in_progress() {
+            utils::print_info("Committing resolved shadow merge...");
+        }
+        let remaining_refs: Vec<&str> =
+            state.remaining_sources.iter().map(|s| s.as_str()).collect();
+        match git.continue_shadow_merge(&state.shadow_name, &remaining_refs) {
+            Ok(()) => {
+                cache.clear_shadow_merge_state();
+                utils::print_success(&format!("Shadow branch '{}' rebuilt", state.shadow_name));
+                git.checkout_branch(&state.original_branch)?;
+            }
+            Err(e) => {
+                if let Some(conflict) = e.downcast_ref::<crate::git::ShadowMergeConflict>() {
+                    cache.save_shadow_merge_state(&crate::cache::ShadowMergeState {
+                        remaining_sources: conflict.remaining_sources.clone(),
+                        ..state
+                    });
+                    return Err(anyhow::anyhow!(
+                        "Another merge conflict while merging '{}'.\n\
+                         Resolve the conflicts, stage the files, then run:\n  \
+                         stax sync --continue",
+                        conflict.failed_source,
+                    ));
+                }
+                return Err(e);
+            }
+        }
+    } else if git.is_rebase_in_progress() {
         utils::print_info("Continuing rebase...");
         git.rebase_continue()?;
         utils::print_success("Rebase continued successfully");
