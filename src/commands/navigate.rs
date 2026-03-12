@@ -38,7 +38,10 @@ impl CursorGuard {
         let term = Term::stderr();
         // Install SIGINT handler before hiding cursor
         unsafe {
-            libc::signal(libc::SIGINT, restore_cursor_on_signal as libc::sighandler_t);
+            libc::signal(
+                libc::SIGINT,
+                restore_cursor_on_signal as *const () as libc::sighandler_t,
+            );
         }
         term.hide_cursor()?;
         CURSOR_HIDDEN.store(true, Ordering::Relaxed);
