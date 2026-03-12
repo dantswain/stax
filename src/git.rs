@@ -491,6 +491,90 @@ impl GitRepo {
         Ok(true)
     }
 
+    /// Create (or recreate) a shadow branch by merging multiple source branches.
+    ///
+    /// Deletes the old branch if it exists, creates from `sources[0]`, then
+    /// merges the remaining sources with `--no-ff`. Fails fast on conflict
+    /// (no in-progress merge left behind).
+    pub fn recreate_shadow_branch(&self, shadow_name: &str, sources: &[&str]) -> Result<()> {
+        assert!(sources.len() >= 2, "shadow branch needs at least 2 sources");
+        log::debug!(
+            "recreate_shadow_branch: '{}' from {:?}",
+            shadow_name,
+            sources
+        );
+        let workdir = self.workdir()?;
+
+        // Save current branch to restore later
+        let current = self.current_branch()?;
+
+        // Delete old shadow branch if it exists
+        if self
+            .repo
+            .find_branch(shadow_name, BranchType::Local)
+            .is_ok()
+        {
+            // Can't delete the branch we're on
+            if current == shadow_name {
+                self.checkout_branch(sources[0])?;
+            }
+            let mut branch = self.repo.find_branch(shadow_name, BranchType::Local)?;
+            branch.delete()?;
+            log::debug!("recreate_shadow_branch: deleted old '{}'", shadow_name);
+        }
+
+        // Create from first source
+        self.create_branch(shadow_name, Some(&format!("refs/heads/{}", sources[0])))?;
+        self.checkout_branch(shadow_name)?;
+
+        // Merge remaining sources
+        for &source in &sources[1..] {
+            let output = std::process::Command::new("git")
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "-m",
+                    &format!("stax: merge {source} into {shadow_name}"),
+                    source,
+                ])
+                .current_dir(workdir)
+                .output()?;
+
+            if !output.status.success() {
+                // Abort the merge so we don't leave a dirty state
+                let _ = std::process::Command::new("git")
+                    .args(["merge", "--abort"])
+                    .current_dir(workdir)
+                    .output();
+
+                // Restore original branch
+                let _ = self.checkout_branch(&current);
+
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!(
+                    "Failed to create shadow branch '{}': merge conflict between sources.\n\
+                     Source '{}' conflicts with prior sources.\n\
+                     Hint: resolve the conflict between '{}' and '{}' before including.\n\
+                     {}",
+                    shadow_name,
+                    source,
+                    sources[0],
+                    source,
+                    stderr.trim()
+                ));
+            }
+        }
+
+        // Restore original branch
+        self.checkout_branch(&current)?;
+
+        log::debug!(
+            "recreate_shadow_branch: '{}' created successfully",
+            shadow_name
+        );
+        Ok(())
+    }
+
     /// Delete a local branch and optionally its remote counterpart.
     pub fn delete_branch(&self, branch_name: &str, delete_remote: bool) -> Result<()> {
         log::debug!(

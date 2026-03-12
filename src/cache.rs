@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Serialised types
@@ -17,6 +17,8 @@ pub struct CacheFile {
     pub branches: HashMap<String, CachedBranch>,
     #[serde(default)]
     pub pull_requests: HashMap<String, CachedPullRequest>,
+    #[serde(default)]
+    pub shadow_branches: HashMap<String, ShadowBranch>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -31,6 +33,15 @@ pub struct TrunkInfo {
 pub struct CachedBranch {
     pub tip: String,
     pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge_sources: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowBranch {
+    pub consumer: String,
+    pub sources: Vec<String>,
+    pub tip: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,15 +249,78 @@ impl StackCache {
             &tip[..tip.len().min(8)],
             parent
         );
+        // Preserve existing merge_sources if present
+        let merge_sources = data
+            .branches
+            .get(branch)
+            .map(|b| b.merge_sources.clone())
+            .unwrap_or_default();
         data.branches.insert(
             branch.to_string(),
             CachedBranch {
                 tip: tip.to_string(),
                 parent: parent.map(|s| s.to_string()),
+                merge_sources,
             },
         );
         self.save(&data);
         self.data = Some(data);
+    }
+
+    /// Insert or update a shadow branch entry, and save.
+    pub fn upsert_shadow(&mut self, shadow_name: &str, shadow: ShadowBranch) {
+        if self.load().is_none() {
+            log::debug!("cache: upsert_shadow skipped — no existing cache");
+            return;
+        }
+        let mut data = self.data.take().unwrap();
+        log::debug!(
+            "cache: upsert_shadow '{}' consumer='{}' sources={:?}",
+            shadow_name,
+            shadow.consumer,
+            shadow.sources,
+        );
+        data.shadow_branches.insert(shadow_name.to_string(), shadow);
+        self.save(&data);
+        self.data = Some(data);
+    }
+
+    /// Remove a shadow branch entry.
+    pub fn remove_shadow(&mut self, shadow_name: &str) {
+        if self.load().is_none() {
+            return;
+        }
+        let mut data = self.data.take().unwrap();
+        if data.shadow_branches.remove(shadow_name).is_some() {
+            log::debug!("cache: removed shadow '{}'", shadow_name);
+            self.save(&data);
+        }
+        self.data = Some(data);
+    }
+
+    /// Look up the shadow branch for a consumer branch.
+    pub fn get_shadow_for_consumer(&self, consumer: &str) -> Option<(&String, &ShadowBranch)> {
+        let data = self.data.as_ref()?;
+        data.shadow_branches
+            .iter()
+            .find(|(_, sb)| sb.consumer == consumer)
+    }
+
+    /// Return the shadow branch name for a consumer.
+    pub fn shadow_name_for(consumer: &str) -> String {
+        format!("stax/shadow/{consumer}")
+    }
+
+    /// Mutably borrow the loaded cache data (if any).
+    pub fn data_mut(&mut self) -> Option<&mut CacheFile> {
+        self.data.as_mut()
+    }
+
+    /// Save the currently loaded data back to disk.
+    pub fn save_current(&self) {
+        if let Some(data) = &self.data {
+            self.save(data);
+        }
     }
 
     /// Persist cache data to disk.  Failures are logged and swallowed.
@@ -287,11 +361,19 @@ impl StackCache {
         for (name, parent) in parent_map {
             // Skip trunk branches — they don't have parents in the cache
             if let Some(tip) = commits.get(name) {
+                // Carry forward merge_sources from existing cache
+                let merge_sources = self
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.branches.get(name))
+                    .map(|b| b.merge_sources.clone())
+                    .unwrap_or_default();
                 branches.insert(
                     name.clone(),
                     CachedBranch {
                         tip: tip.clone(),
                         parent: parent.clone(),
+                        merge_sources,
                     },
                 );
             }
@@ -310,6 +392,13 @@ impl StackCache {
             })
             .unwrap_or_default();
 
+        // Carry forward shadow branches (they are managed by `include` / `sync`)
+        let shadow_branches = self
+            .data
+            .as_ref()
+            .map(|d| d.shadow_branches.clone())
+            .unwrap_or_default();
+
         CacheFile {
             schema_version: SCHEMA_VERSION,
             trunk: TrunkInfo {
@@ -319,6 +408,7 @@ impl StackCache {
             },
             branches,
             pull_requests,
+            shadow_branches,
         }
     }
 
@@ -455,6 +545,7 @@ mod tests {
             CachedBranch {
                 tip: "aaa111".to_string(),
                 parent: Some("main".to_string()),
+                merge_sources: Vec::new(),
             },
         );
         branches.insert(
@@ -462,6 +553,7 @@ mod tests {
             CachedBranch {
                 tip: "bbb222".to_string(),
                 parent: Some("feature-a".to_string()),
+                merge_sources: Vec::new(),
             },
         );
 
@@ -474,6 +566,7 @@ mod tests {
             },
             branches,
             pull_requests: HashMap::new(),
+            shadow_branches: HashMap::new(),
         }
     }
 

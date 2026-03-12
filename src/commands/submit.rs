@@ -64,6 +64,12 @@ async fn submit_branches(
             continue;
         }
 
+        // Push shadow branches (needed as PR base) but skip PR operations for them
+        if crate::commands::navigate::is_shadow_branch(&branch.name) {
+            push_branch(git, config, &branch.name)?;
+            continue;
+        }
+
         push_branch(git, config, &branch.name)?;
 
         if let Some(existing_pr) = &branch.pull_request {
@@ -544,6 +550,7 @@ mod tests {
             commit_hash: "abc123".to_string(),
             pull_request: pr,
             is_current: false,
+            merge_sources: Vec::new(),
         }
     }
 

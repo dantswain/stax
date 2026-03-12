@@ -90,6 +90,9 @@ pub async fn run(
     merged.extend(locally_merged);
     log::debug!("sync: found {} merged/closed branches", merged.len());
 
+    // 5b. Check shadow branch sources for dissolution
+    dissolve_shadows_if_needed(&git, &merged, trunk)?;
+
     // 6. Delete merged/closed branches
     if !merged.is_empty() {
         delete_merged_branches(&git, &merged, &original_branch, trunk, force)?;
@@ -419,9 +422,25 @@ async fn restack_all(
         original_branch: current_branch.to_string(),
     });
 
+    // Load shadow branch data for recreating shadows during restack
+    let mut shadow_cache = StackCache::new(&git.git_dir());
+    shadow_cache.load();
+    let shadow_branches: HashMap<String, crate::cache::ShadowBranch> = shadow_cache
+        .data_ref()
+        .map(|d| d.shadow_branches.clone())
+        .unwrap_or_default();
+
     let mut restacked = Vec::new();
 
     for (branch, parent, _) in &to_rebase {
+        // If the parent is a shadow branch, recreate it from its sources first
+        if crate::commands::navigate::is_shadow_branch(parent) {
+            if let Some(shadow) = shadow_branches.get(parent) {
+                utils::print_info(&format!("Recreating shadow branch '{parent}'"));
+                let source_refs: Vec<&str> = shadow.sources.iter().map(|s| s.as_str()).collect();
+                git.recreate_shadow_branch(parent, &source_refs)?;
+            }
+        }
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
         // Use the parent's pre-rebase tip so --onto only replays branch's own commits
         let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
@@ -561,6 +580,109 @@ async fn build_stack_with_live_prs(
     }
 
     Ok(stack)
+}
+
+/// Check shadow branches and dissolve them when sources have been merged.
+///
+/// - All sources merged: delete shadow, reparent consumer to trunk.
+/// - Some sources merged: remove them from sources, recreate shadow or
+///   dissolve to single parent.
+fn dissolve_shadows_if_needed(
+    git: &GitRepo,
+    merged_branches: &[(String, String)],
+    trunk: &str,
+) -> Result<()> {
+    let mut cache = StackCache::new(&git.git_dir());
+    if cache.load().is_none() {
+        return Ok(());
+    }
+
+    let merged_set: HashSet<String> = merged_branches.iter().map(|(n, _)| n.clone()).collect();
+
+    let shadows: Vec<(String, crate::cache::ShadowBranch)> = cache
+        .data_ref()
+        .map(|d| {
+            d.shadow_branches
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (shadow_name, shadow) in &shadows {
+        let remaining: Vec<String> = shadow
+            .sources
+            .iter()
+            .filter(|s| !merged_set.contains(*s))
+            .cloned()
+            .collect();
+
+        if remaining.len() == shadow.sources.len() {
+            // No sources merged — nothing to do
+            continue;
+        }
+
+        if remaining.len() <= 1 {
+            // All (or all but one) sources merged — dissolve the shadow
+            let new_parent = remaining.first().map(|s| s.as_str()).unwrap_or(trunk);
+            utils::print_info(&format!(
+                "Dissolving shadow '{}' — reparenting '{}' to '{}'",
+                shadow_name, shadow.consumer, new_parent
+            ));
+
+            // Delete shadow branch (local)
+            if git
+                .get_commit_hash(&format!("refs/heads/{shadow_name}"))
+                .is_ok()
+            {
+                let current = git.current_branch()?;
+                if current == *shadow_name {
+                    git.checkout_branch(new_parent)?;
+                }
+                let _ = git.delete_branch(shadow_name, true);
+            }
+
+            // Update cache: remove shadow entry, update consumer parent
+            cache.remove_shadow(shadow_name);
+            if let Some(data) = cache.data_mut() {
+                if let Some(branch) = data.branches.get_mut(&shadow.consumer) {
+                    branch.parent = Some(new_parent.to_string());
+                    branch.merge_sources.clear();
+                }
+                data.branches.remove(shadow_name);
+            }
+            cache.save_current();
+
+            utils::print_success(&format!("Shadow '{}' dissolved", shadow_name));
+        } else {
+            // Some sources merged but 2+ remain — recreate the shadow
+            utils::print_info(&format!(
+                "Recreating shadow '{}' with remaining sources: {:?}",
+                shadow_name, remaining
+            ));
+            let source_refs: Vec<&str> = remaining.iter().map(|s| s.as_str()).collect();
+            git.recreate_shadow_branch(shadow_name, &source_refs)?;
+
+            // Update cache
+            let shadow_tip = git.get_commit_hash(&format!("refs/heads/{shadow_name}"))?;
+            cache.upsert_shadow(
+                shadow_name,
+                crate::cache::ShadowBranch {
+                    consumer: shadow.consumer.clone(),
+                    sources: remaining.clone(),
+                    tip: shadow_tip,
+                },
+            );
+            if let Some(data) = cache.data_mut() {
+                if let Some(branch) = data.branches.get_mut(&shadow.consumer) {
+                    branch.merge_sources = remaining;
+                }
+            }
+            cache.save_current();
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute the depth of a branch in the stack (distance from root).

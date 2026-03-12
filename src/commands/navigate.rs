@@ -72,6 +72,11 @@ pub fn is_main_branch(name: &str) -> bool {
     MAIN_BRANCHES.contains(&name)
 }
 
+/// Whether a branch is a shadow branch (managed by `stax include`).
+pub fn is_shadow_branch(name: &str) -> bool {
+    name.starts_with("stax/shadow/")
+}
+
 /// Render a branch and its descendants as an ASCII tree with commit messages.
 fn render_subtree(
     ctx: &BranchContext,
@@ -293,6 +298,10 @@ pub fn find_parent(
         if candidate == branch {
             continue;
         }
+        // Skip shadow branches — their parents are managed by `include`
+        if is_shadow_branch(candidate) {
+            continue;
+        }
         // Skip merged non-trunk branches
         if !is_main_branch(candidate) && merged.contains(candidate) {
             continue;
@@ -397,6 +406,10 @@ pub fn find_children(
         if candidate == branch || is_main_branch(candidate) {
             continue;
         }
+        // Skip shadow branches — they are internal to `include`
+        if is_shadow_branch(candidate) {
+            continue;
+        }
         // Skip merged branches — they shouldn't be navigation targets and
         // their commits in trunk history cause false positives.
         if merged.contains(candidate) {
@@ -455,12 +468,13 @@ pub fn build_parent_map(
     let mut map = HashMap::new();
 
     // Separate main branches (trivial: parent = None) from active branches
-    // that need find_parent.
+    // that need find_parent.  Shadow branches are managed by `include` and
+    // injected from cache separately — don't compute them heuristically.
     let mut active: Vec<&String> = Vec::new();
     for branch in all_branches {
         if is_main_branch(branch) {
             map.insert(branch.clone(), None);
-        } else if !merged.contains(branch) {
+        } else if !merged.contains(branch) && !is_shadow_branch(branch) {
             active.push(branch);
         }
     }
@@ -524,6 +538,7 @@ pub fn build_parent_map(
 }
 
 /// Look up direct children of `branch` from a pre-computed parent map.
+/// Shadow branches are resolved to their consumers so callers never see them.
 pub fn children_from_map(
     branch: &str,
     parent_map: &HashMap<String, Option<String>>,
@@ -536,17 +551,30 @@ pub fn children_from_map(
         }
         if let Some(p) = parent {
             if p == branch {
-                children.push(candidate.clone());
+                if is_shadow_branch(candidate) {
+                    // Replace shadow with its consumer (the branch that
+                    // has the shadow as parent)
+                    for (inner, inner_parent) in parent_map {
+                        if let Some(ip) = inner_parent {
+                            if ip == candidate && !is_shadow_branch(inner) {
+                                children.push(inner.clone());
+                            }
+                        }
+                    }
+                } else {
+                    children.push(candidate.clone());
+                }
             }
         }
     }
     children.sort();
+    children.dedup();
     children
 }
 
 /// Walk from `start` towards the top of its stack, following linear chains.
 /// Stops at the leaf (no children) or at a fork (multiple children).
-/// Returns the top-most branch reached.
+/// Returns the top-most branch reached. Skips shadow branches.
 pub fn walk_to_top(
     start: &str,
     parent_map: &HashMap<String, Option<String>>,
@@ -554,7 +582,10 @@ pub fn walk_to_top(
 ) -> String {
     let mut current = start.to_string();
     loop {
-        let children = children_from_map(&current, parent_map, merged);
+        let children: Vec<String> = children_from_map(&current, parent_map, merged)
+            .into_iter()
+            .filter(|c| !is_shadow_branch(c))
+            .collect();
         match children.len() {
             0 => break,
             1 => current = children[0].clone(),
@@ -565,7 +596,7 @@ pub fn walk_to_top(
 }
 
 /// Find branches that form the base of stacks off `main_branch`
-/// using a pre-computed parent map.
+/// using a pre-computed parent map. Shadow branches are excluded.
 pub fn root_children_from_map(
     main_branch: &str,
     parent_map: &HashMap<String, Option<String>>,
@@ -573,7 +604,11 @@ pub fn root_children_from_map(
 ) -> Vec<String> {
     let mut root_children = Vec::new();
     for (branch, parent) in parent_map {
-        if branch == main_branch || is_main_branch(branch) || merged.contains(branch) {
+        if branch == main_branch
+            || is_main_branch(branch)
+            || merged.contains(branch)
+            || is_shadow_branch(branch)
+        {
             continue;
         }
         if let Some(p) = parent {
@@ -708,6 +743,45 @@ fn apply_pr_overrides(
     }
 }
 
+/// Inject shadow branch entries from the cache into the parent map.
+///
+/// Shadow branches and their consumers have managed parent relationships
+/// (set by `stax include`) that should not be overridden by heuristic
+/// computation. This function adds those entries to the parent map.
+fn inject_shadow_entries(
+    parent_map: &mut HashMap<String, Option<String>>,
+    cache: &StackCache,
+    all_branches: &[String],
+) {
+    let data = match cache.data_ref() {
+        Some(d) => d,
+        None => return,
+    };
+    if data.shadow_branches.is_empty() {
+        return;
+    }
+    let branch_set: HashSet<&str> = all_branches.iter().map(|s| s.as_str()).collect();
+    let mut count = 0u32;
+    for (shadow_name, shadow) in &data.shadow_branches {
+        // Only inject if the shadow branch actually exists locally
+        if !branch_set.contains(shadow_name.as_str()) {
+            continue;
+        }
+        // Shadow's parent = first source
+        if let Some(first_source) = shadow.sources.first() {
+            parent_map.insert(shadow_name.clone(), Some(first_source.clone()));
+        }
+        // Consumer's parent = shadow
+        if branch_set.contains(shadow.consumer.as_str()) {
+            parent_map.insert(shadow.consumer.clone(), Some(shadow_name.clone()));
+        }
+        count += 1;
+    }
+    if count > 0 {
+        log::debug!("cache: injected {} shadow branch entries", count);
+    }
+}
+
 /// Load branches, commit hashes, merged status, and parent map.
 ///
 /// Uses a local cache (`.git/stax/cache.json`) when all branch tips match,
@@ -753,6 +827,7 @@ pub fn get_branches_and_parent_map(
                 let mut parent_map = StackCache::to_parent_map(data);
                 let merged = StackCache::to_merged_set(data);
                 apply_pr_overrides(&mut parent_map, &cache, &all);
+                inject_shadow_entries(&mut parent_map, &cache, &all);
                 return Ok((all, commits, merged, parent_map));
             }
 
@@ -816,6 +891,7 @@ pub fn get_branches_and_parent_map(
             // Apply PR overrides before saving — the saved cache should
             // reflect the authoritative parent relationships.
             apply_pr_overrides(&mut parent_map, &cache, &all);
+            inject_shadow_entries(&mut parent_map, &cache, &all);
 
             // Save updated cache (preserves existing PR data)
             let trunk_tip = commits.get(&trunk_name).cloned().unwrap_or_default();
@@ -834,6 +910,7 @@ pub fn get_branches_and_parent_map(
 
     // Apply PR overrides (cache may still have PR data even on branch miss)
     apply_pr_overrides(&mut parent_map, &cache, &all);
+    inject_shadow_entries(&mut parent_map, &cache, &all);
 
     // Save for next time (preserves existing PR data)
     let trunk_tip = commits.get(&trunk_name).cloned().unwrap_or_default();
@@ -1001,13 +1078,42 @@ pub async fn down() -> Result<()> {
         return Err(anyhow!("Already at the bottom of the stack"));
     }
 
-    let (_branches, _commits, _merged, parent_map) = get_branches_and_parent_map(&git)?;
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
     let parent = parent_map
         .get(&current)
         .and_then(|p| p.clone())
         .ok_or_else(|| anyhow!("Already at the bottom of the stack"))?;
-    log::debug!("navigate down: target='{}'", parent);
 
+    // If parent is a shadow branch, offer its sources as choices
+    if is_shadow_branch(&parent) {
+        let mut cache = StackCache::new(&git.git_dir());
+        cache.load();
+        if let Some((_, shadow)) = cache.get_shadow_for_consumer(&current) {
+            let sources = shadow.sources.clone();
+            let ctx = BranchContext {
+                git: &git,
+                all_branches: &branches,
+                commits: &commits,
+                merged: &merged,
+            };
+            let target = match sources.len() {
+                0 => return Err(anyhow!("Shadow branch has no sources")),
+                1 => sources[0].clone(),
+                _ => pick_branch_with_preview(
+                    "Multiple source branches — pick one to move to",
+                    &sources,
+                    &current,
+                    &ctx,
+                    None,
+                )?,
+            };
+            git.checkout_branch(&target)?;
+            utils::print_success(&format!("Moved down to {}", target));
+            return Ok(());
+        }
+    }
+
+    log::debug!("navigate down: target='{}'", parent);
     git.checkout_branch(&parent)?;
     utils::print_success(&format!("Moved down to {}", parent));
     Ok(())
@@ -1088,11 +1194,19 @@ pub async fn bottom() -> Result<()> {
         };
     }
 
-    // Walk parent chain using the pre-computed map
+    // Walk parent chain using the pre-computed map, skipping shadow branches
     let mut target = current.clone();
     loop {
         match parent_map.get(&target).and_then(|p| p.as_ref()) {
             Some(p) if is_main_branch(p) => break,
+            Some(p) if is_shadow_branch(p) => {
+                // Skip past the shadow to its parent
+                match parent_map.get(p).and_then(|pp| pp.as_ref()) {
+                    Some(gp) if is_main_branch(gp) => break,
+                    Some(gp) => target = gp.clone(),
+                    None => break,
+                }
+            }
             Some(p) => target = p.clone(),
             None => break,
         }

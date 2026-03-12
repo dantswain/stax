@@ -1,5 +1,5 @@
 use crate::cache::{RestackState, StackCache};
-use crate::commands::navigate::get_branches_and_parent_map;
+use crate::commands::navigate::{get_branches_and_parent_map, is_shadow_branch};
 use crate::git::GitRepo;
 use crate::stack::Stack;
 use crate::utils;
@@ -142,8 +142,25 @@ async fn do_restack(git: &GitRepo, all: bool) -> Result<()> {
 
     let mut restacked = Vec::new();
 
+    // Load shadow branch data for recreating shadows
+    let mut shadow_cache = StackCache::new(&git.git_dir());
+    shadow_cache.load();
+    let shadow_branches: std::collections::HashMap<String, crate::cache::ShadowBranch> =
+        shadow_cache
+            .data_ref()
+            .map(|d| d.shadow_branches.clone())
+            .unwrap_or_default();
+
     log::debug!("restack: {} branches to rebase", branches_to_rebase.len());
     for (branch, parent) in &branches_to_rebase {
+        // If the parent is a shadow branch, recreate it from its sources first
+        if is_shadow_branch(parent) {
+            if let Some(shadow) = shadow_branches.get(parent) {
+                utils::print_info(&format!("Recreating shadow branch '{}'", parent));
+                let source_refs: Vec<&str> = shadow.sources.iter().map(|s| s.as_str()).collect();
+                git.recreate_shadow_branch(parent, &source_refs)?;
+            }
+        }
         utils::print_info(&format!("Rebasing '{}' onto '{}'", branch, parent));
         let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
         git.rebase_onto_with_base(
