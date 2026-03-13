@@ -237,6 +237,12 @@ fn push_branch(git: &GitRepo, config: &Config, branch_name: &str) -> Result<()> 
         ));
         git.push_branch(branch_name, true)?;
         utils::print_success(&format!("Force-pushed '{branch_name}'"));
+    } else if git.is_ahead_of_remote(branch_name)? {
+        utils::print_info(&format!(
+            "Branch '{branch_name}' is ahead of remote, pushing..."
+        ));
+        git.push_branch(branch_name, false)?;
+        utils::print_success(&format!("Pushed '{branch_name}'"));
     } else if !git.has_remote_branch(branch_name)? {
         if config.auto_push {
             utils::print_info(&format!("Pushing branch '{branch_name}' to remote..."));
