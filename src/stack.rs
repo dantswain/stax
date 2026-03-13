@@ -15,6 +15,7 @@ pub struct StackBranch {
     pub commit_hash: String,
     pub pull_request: Option<PullRequest>,
     pub is_current: bool,
+    pub merge_sources: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +112,7 @@ impl Stack {
                     commit_hash,
                     pull_request,
                     is_current,
+                    merge_sources: Vec::new(),
                 },
             );
         }
@@ -327,6 +329,7 @@ impl Stack {
                     commit_hash,
                     pull_request,
                     is_current,
+                    merge_sources: Vec::new(),
                 },
             );
         }
@@ -469,6 +472,7 @@ impl Stack {
                     commit_hash,
                     pull_request,
                     is_current,
+                    merge_sources: Vec::new(),
                 },
             );
         }
@@ -479,6 +483,20 @@ impl Stack {
             }
             if let Some(parent_branch) = stack_branches.get_mut(&parent) {
                 parent_branch.children.push(child);
+            }
+        }
+
+        // Populate merge_sources from cache
+        {
+            let mut cache = crate::cache::StackCache::new(&git.git_dir());
+            if let Some(data) = cache.load() {
+                for (name, cached) in &data.branches {
+                    if !cached.merge_sources.is_empty() {
+                        if let Some(sb) = stack_branches.get_mut(name) {
+                            sb.merge_sources = cached.merge_sources.clone();
+                        }
+                    }
+                }
             }
         }
 
@@ -679,6 +697,7 @@ mod tests {
             commit_hash: "abc123".to_string(),
             pull_request: None,
             is_current: false,
+            merge_sources: Vec::new(),
         }
     }
 

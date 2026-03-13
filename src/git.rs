@@ -4,6 +4,27 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Error returned when a shadow branch merge hits a conflict.
+/// Contains enough information for callers to persist state for `--continue`.
+#[derive(Debug)]
+pub struct ShadowMergeConflict {
+    pub shadow_name: String,
+    pub failed_source: String,
+    pub remaining_sources: Vec<String>,
+}
+
+impl std::fmt::Display for ShadowMergeConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Merge conflict in shadow branch '{}' while merging '{}'",
+            self.shadow_name, self.failed_source
+        )
+    }
+}
+
+impl std::error::Error for ShadowMergeConflict {}
+
 pub struct GitRepo {
     repo: Repository,
     /// Cache for revparse_single results (refspec → OID).
@@ -489,6 +510,152 @@ impl GitRepo {
         }
 
         Ok(true)
+    }
+
+    /// Create (or recreate) a shadow branch by merging multiple source branches.
+    ///
+    /// Deletes the old branch if it exists, creates from `sources[0]`, then
+    /// merges the remaining sources with `--no-ff`.
+    ///
+    /// On merge conflict, leaves the merge in progress for the user to resolve.
+    /// Returns `Err` with a `ShadowMergeConflict` that callers can use to
+    /// persist state for `--continue`.
+    pub fn recreate_shadow_branch(&self, shadow_name: &str, sources: &[&str]) -> Result<()> {
+        assert!(sources.len() >= 2, "shadow branch needs at least 2 sources");
+        log::debug!(
+            "recreate_shadow_branch: '{}' from {:?}",
+            shadow_name,
+            sources
+        );
+        let workdir = self.workdir()?;
+
+        // Save current branch to restore later
+        let current = self.current_branch()?;
+
+        // Delete old shadow branch if it exists
+        if self
+            .repo
+            .find_branch(shadow_name, BranchType::Local)
+            .is_ok()
+        {
+            // Can't delete the branch we're on
+            if current == shadow_name {
+                self.checkout_branch(sources[0])?;
+            }
+            let mut branch = self.repo.find_branch(shadow_name, BranchType::Local)?;
+            branch.delete()?;
+            log::debug!("recreate_shadow_branch: deleted old '{}'", shadow_name);
+        }
+
+        // Create from first source
+        self.create_branch(shadow_name, Some(&format!("refs/heads/{}", sources[0])))?;
+        self.checkout_branch(shadow_name)?;
+
+        // Merge remaining sources
+        self.merge_shadow_sources(shadow_name, &sources[1..], workdir)?;
+
+        // Restore original branch
+        self.checkout_branch(&current)?;
+
+        log::debug!(
+            "recreate_shadow_branch: '{}' created successfully",
+            shadow_name
+        );
+        Ok(())
+    }
+
+    /// Continue building a shadow branch after the user has resolved a merge
+    /// conflict. Commits the resolved merge, then merges any remaining sources.
+    pub fn continue_shadow_merge(
+        &self,
+        shadow_name: &str,
+        remaining_sources: &[&str],
+    ) -> Result<()> {
+        log::debug!(
+            "continue_shadow_merge: '{}' remaining={:?}",
+            shadow_name,
+            remaining_sources
+        );
+        let workdir = self.workdir()?;
+
+        // We should be on the shadow branch with a merge in progress
+        let current = self.current_branch()?;
+        if current != shadow_name {
+            return Err(anyhow!(
+                "Expected to be on '{}' but on '{}'. \
+                 Did you switch branches during conflict resolution?",
+                shadow_name,
+                current
+            ));
+        }
+
+        // Commit the resolved merge
+        let output = std::process::Command::new("git")
+            .args(["commit", "--no-edit"])
+            .current_dir(workdir)
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+
+        if !output.success() {
+            return Err(anyhow!(
+                "git commit failed. Make sure all conflicts are resolved and staged."
+            ));
+        }
+
+        // Merge remaining sources
+        if !remaining_sources.is_empty() {
+            self.merge_shadow_sources(shadow_name, remaining_sources, workdir)?;
+        }
+
+        Ok(())
+    }
+
+    /// Merge a sequence of sources into the current branch (which should be
+    /// the shadow branch). On conflict, leaves the merge in progress and
+    /// returns an error with the failing source and remaining sources.
+    fn merge_shadow_sources(
+        &self,
+        shadow_name: &str,
+        sources: &[&str],
+        workdir: &Path,
+    ) -> Result<()> {
+        for (i, &source) in sources.iter().enumerate() {
+            let output = std::process::Command::new("git")
+                .args([
+                    "merge",
+                    "--no-ff",
+                    "-m",
+                    &format!("stax: merge {source} into {shadow_name}"),
+                    source,
+                ])
+                .current_dir(workdir)
+                .output()?;
+
+            if !output.status.success() {
+                // Leave merge in progress for user to resolve.
+                // Return enough info for callers to persist remaining sources.
+                let remaining: Vec<&str> = sources[i + 1..].to_vec();
+                return Err(ShadowMergeConflict {
+                    shadow_name: shadow_name.to_string(),
+                    failed_source: source.to_string(),
+                    remaining_sources: remaining.iter().map(|s| s.to_string()).collect(),
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if a git merge is currently in progress.
+    pub fn is_merge_in_progress(&self) -> bool {
+        if let Ok(workdir) = self.workdir() {
+            let git_dir = workdir.join(".git");
+            git_dir.join("MERGE_HEAD").exists()
+        } else {
+            false
+        }
     }
 
     /// Delete a local branch and optionally its remote counterpart.

@@ -16,6 +16,7 @@ Stax is inspired by [Graphite's CLI](https://graphite.com/docs/cli-overview) but
 - 🔄 **Branch Management**: Create new branches with proper parent-child relationships
 - 📝 **PR Integration**: Create and manage GitHub pull requests for your stack
 - 🔄 **Sync & Restack**: Keep your branches up to date with their parents
+- 💎 **Diamond Merges**: Include multiple independent branches as dependencies for a single branch
 - 🔧 **Topology Repair**: Automatically detect and fix broken branch relationships using PR data
 - ⚙️ **Configuration**: Flexible configuration management
 
@@ -223,6 +224,12 @@ stax restack --all
 # Continue restack after resolving rebase conflicts
 stax restack --continue
 
+# Include another branch as a merge dependency (diamond merge)
+stax include other-branch
+
+# Continue after resolving shadow merge conflicts
+stax include --continue
+
 # Check branch topology against PR data (dry run)
 stax repair --check
 
@@ -245,6 +252,78 @@ stax bottom   # Jump to the first branch above main
 ```
 
 When a branch has multiple children, you'll be prompted to pick one.
+
+### Diamond Merges
+
+Sometimes a branch needs changes from two independent branches that haven't been merged to main yet. For example, your `add-payments` branch needs both `add-auth` and `add-database`, which are separate PRs in flight. Stax handles this with the `include` command:
+
+```bash
+# You're on add-payments, which is stacked on add-auth
+$ stax down
+✓ Moved down to add-auth
+
+$ stax up
+✓ Moved up to add-payments
+
+# Include add-database as an additional dependency
+$ stax include add-database
+ℹ Creating shadow branch 'stax/shadow/add-payments' from ["add-auth", "add-database"]
+ℹ Rebasing 'add-payments' onto shadow branch...
+✓ Included 'add-database' into 'add-payments' via shadow branch
+ℹ Sources: add-auth, add-database
+
+# The stack shows the merge relationship
+$ stax stack
+Stack Visualization
+
+main ○
+  ├─ add-auth ● PR #1
+    ├─ add-payments [+add-database] ← current ○
+  ├─ add-database ● PR #2
+    ├─ add-payments [+add-auth]
+```
+
+**How it works:**
+
+Stax creates a hidden **shadow branch** (`stax/shadow/<your-branch>`) that merges all source branches together, then rebases your branch on top of it. Shadow branches are:
+
+- **Invisible in navigation** — `stax up/down/top/bottom` skip them
+- **Hidden in stack visualization** — you see `[+other_source]` annotations instead
+- **Automatically recreated during restack** — when sources are updated, the shadow is rebuilt
+- **Pushed during submit** — the shadow branch is pushed to the remote as the PR base
+- **Dissolved during sync** — when all sources are merged to main, the shadow is deleted and your branch is reparented
+
+You can include multiple branches:
+
+```bash
+$ stax include add-logging    # Now depends on add-auth, add-database, and add-logging
+```
+
+**Handling merge conflicts:**
+
+If the source branches conflict with each other, `stax include` will leave the merge in progress for you to resolve:
+
+```bash
+$ stax include add-conflicting
+ℹ Creating shadow branch 'stax/shadow/add-payments' from ["add-auth", "add-conflicting"]
+Error: Merge conflict while building shadow branch 'stax/shadow/add-payments'.
+Source 'add-conflicting' conflicts with prior sources.
+
+Resolve the conflicts, stage the files, then run:
+  stax include --continue
+
+To abort instead:
+  git merge --abort && git checkout add-payments
+```
+
+After resolving the conflicts and staging the files, run `stax include --continue` to finish building the shadow branch. The same `--continue` flow works for shadow merge conflicts during `stax restack` and `stax sync`.
+
+**When a source branch is merged:**
+
+Running `stax sync` automatically handles dissolution:
+- If all sources are merged to main, the shadow is deleted and the consumer is reparented to main
+- If some sources remain, the shadow is recreated with only the remaining sources
+- If only one source remains, the shadow is dissolved entirely and the consumer becomes a normal stacked branch
 
 ### Configuration Management
 
@@ -348,10 +427,10 @@ cargo fmt
 
 ## Testing Coverage
 
-The project includes 190 tests across unit and integration suites:
+The project includes 223 tests across unit and integration suites:
 
-- **Unit Tests** (83 tests, in-module `#[cfg(test)]`):
-  - `cache.rs` — Cache roundtrip, schema validation, restack state persistence, branch upsert, PR data
+- **Unit Tests** (92 tests, in-module `#[cfg(test)]`):
+  - `cache.rs` — Cache roundtrip, schema validation, restack state persistence, branch upsert, PR data, shadow branch helpers
   - `config.rs` — Config defaults, set/get, TOML generation, path resolution, log level
   - `github.rs` — URL parsing (SSH/HTTPS), PR struct serialization
   - `git.rs` — Repo open, is_clean behavior, URL methods
@@ -361,10 +440,12 @@ The project includes 190 tests across unit and integration suites:
   - `utils.rs` — String truncation edge cases
   - `oauth.rs` — Client creation, request structure validation
 
-- **Integration Tests** (107 tests, `tests/`):
+- **Integration Tests** (131 tests, `tests/`):
   - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (26 tests using temp repos with bare remote origins)
   - `navigate_test.rs` — Parent detection, cache warm/cold/partial hits, PR overrides, topological walking, merged branch handling, fork detection (61 tests)
+  - `include_test.rs` — Shadow branch creation/replacement/conflict resolution/continue, is_shadow_branch, parent/children exclusion, children_from_map resolution, cache roundtrip, build_parent_map skipping (12 tests)
   - `stack_test.rs` — `Stack::analyze` and `Stack::from_parent_map` with various topologies: linear, branching, diamond, PR overrides (14 async tests)
+  - `repair_test.rs` — Topology mismatch detection, gap branch inference, topological sorting (12 tests)
   - `restack_test.rs` — `rebase_onto` simple/noop/conflict/full-stack/branch-preservation (5 tests)
   - `token_store_test.rs` — Token store/retrieve, overwrite, whitespace trimming, unix file permissions (1 test)
 
@@ -378,6 +459,7 @@ src/
 │   ├── auth.rs          # GitHub authentication (login/status)
 │   ├── branch.rs        # Branch creation
 │   ├── config.rs        # Configuration management
+│   ├── include.rs       # Diamond merge (stax include)
 │   ├── navigate.rs      # Stack navigation + parent detection + cache integration
 │   ├── repair.rs        # Topology repair using PR data as source of truth
 │   ├── restack.rs       # Branch restacking
@@ -397,7 +479,9 @@ src/
 tests/
 ├── common/mod.rs        # Shared test helpers (temp repo creation)
 ├── git_test.rs          # Git operations integration tests
+├── include_test.rs      # Diamond merge / shadow branch integration tests
 ├── navigate_test.rs     # Navigation, cache, and parent detection tests
+├── repair_test.rs       # Topology repair integration tests
 ├── restack_test.rs      # Rebase integration tests
 ├── stack_test.rs        # Stack analysis integration tests
 └── token_store_test.rs  # Token storage integration tests

@@ -90,6 +90,9 @@ pub async fn run(
     merged.extend(locally_merged);
     log::debug!("sync: found {} merged/closed branches", merged.len());
 
+    // 5b. Check shadow branch sources for dissolution
+    dissolve_shadows_if_needed(&git, &merged, trunk)?;
+
     // 6. Delete merged/closed branches
     if !merged.is_empty() {
         delete_merged_branches(&git, &merged, &original_branch, trunk, force)?;
@@ -419,9 +422,52 @@ async fn restack_all(
         original_branch: current_branch.to_string(),
     });
 
+    // Load shadow branch data for recreating shadows during restack
+    let mut shadow_cache = StackCache::new(&git.git_dir());
+    shadow_cache.load();
+    let shadow_branches: HashMap<String, crate::cache::ShadowBranch> = shadow_cache
+        .data_ref()
+        .map(|d| d.shadow_branches.clone())
+        .unwrap_or_default();
+
     let mut restacked = Vec::new();
 
     for (branch, parent, _) in &to_rebase {
+        // If the parent is a shadow branch, recreate it from its sources first
+        if crate::commands::navigate::is_shadow_branch(parent) {
+            if let Some(shadow) = shadow_branches.get(parent) {
+                utils::print_info(&format!("Recreating shadow branch '{parent}'"));
+                let source_refs: Vec<&str> = shadow.sources.iter().map(|s| s.as_str()).collect();
+                match git.recreate_shadow_branch(parent, &source_refs) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if let Some(conflict) = e.downcast_ref::<crate::git::ShadowMergeConflict>()
+                        {
+                            shadow_cache.save_shadow_merge_state(&crate::cache::ShadowMergeState {
+                                shadow_name: conflict.shadow_name.clone(),
+                                consumer: shadow.consumer.clone(),
+                                all_sources: shadow.sources.clone(),
+                                remaining_sources: conflict.remaining_sources.clone(),
+                                original_branch: current_branch.to_string(),
+                                continue_command: "stax sync --continue".to_string(),
+                            });
+                            return Err(anyhow::anyhow!(
+                                "Merge conflict while rebuilding shadow branch '{}'.\n\
+                                 Source '{}' conflicts with prior sources.\n\n\
+                                 Resolve the conflicts, stage the files, then run:\n  \
+                                 stax sync --continue\n\n\
+                                 To abort instead:\n  \
+                                 git merge --abort && git checkout {}",
+                                conflict.shadow_name,
+                                conflict.failed_source,
+                                current_branch,
+                            ));
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+        }
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
         // Use the parent's pre-rebase tip so --onto only replays branch's own commits
         let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
@@ -446,10 +492,41 @@ async fn restack_all(
     Ok(())
 }
 
-/// Continue a sync after the user has resolved rebase conflicts.
-/// Finishes the in-progress rebase, then restacks any remaining branches.
+/// Continue a sync after the user has resolved rebase or merge conflicts.
+/// Handles shadow merge conflicts, rebase conflicts, then restacks remaining.
 async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()> {
-    if git.is_rebase_in_progress() {
+    let cache = StackCache::new(&git.git_dir());
+
+    // Check if we're continuing a shadow merge conflict
+    if let Some(state) = cache.load_shadow_merge_state() {
+        if git.is_merge_in_progress() {
+            utils::print_info("Committing resolved shadow merge...");
+        }
+        let remaining_refs: Vec<&str> =
+            state.remaining_sources.iter().map(|s| s.as_str()).collect();
+        match git.continue_shadow_merge(&state.shadow_name, &remaining_refs) {
+            Ok(()) => {
+                cache.clear_shadow_merge_state();
+                utils::print_success(&format!("Shadow branch '{}' rebuilt", state.shadow_name));
+                git.checkout_branch(&state.original_branch)?;
+            }
+            Err(e) => {
+                if let Some(conflict) = e.downcast_ref::<crate::git::ShadowMergeConflict>() {
+                    cache.save_shadow_merge_state(&crate::cache::ShadowMergeState {
+                        remaining_sources: conflict.remaining_sources.clone(),
+                        ..state
+                    });
+                    return Err(anyhow::anyhow!(
+                        "Another merge conflict while merging '{}'.\n\
+                         Resolve the conflicts, stage the files, then run:\n  \
+                         stax sync --continue",
+                        conflict.failed_source,
+                    ));
+                }
+                return Err(e);
+            }
+        }
+    } else if git.is_rebase_in_progress() {
         utils::print_info("Continuing rebase...");
         git.rebase_continue()?;
         utils::print_success("Rebase continued successfully");
@@ -561,6 +638,124 @@ async fn build_stack_with_live_prs(
     }
 
     Ok(stack)
+}
+
+/// Check shadow branches and dissolve them when sources have been merged.
+///
+/// - All sources merged: delete shadow, reparent consumer to trunk.
+/// - Some sources merged: remove them from sources, recreate shadow or
+///   dissolve to single parent.
+pub fn dissolve_shadows_if_needed(
+    git: &GitRepo,
+    merged_branches: &[(String, String)],
+    trunk: &str,
+) -> Result<()> {
+    let mut cache = StackCache::new(&git.git_dir());
+    if cache.load().is_none() {
+        return Ok(());
+    }
+
+    let merged_set: HashSet<String> = merged_branches.iter().map(|(n, _)| n.clone()).collect();
+
+    let shadows: Vec<(String, crate::cache::ShadowBranch)> = cache
+        .data_ref()
+        .map(|d| {
+            d.shadow_branches
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (shadow_name, shadow) in &shadows {
+        let remaining: Vec<String> = shadow
+            .sources
+            .iter()
+            .filter(|s| !merged_set.contains(*s))
+            .cloned()
+            .collect();
+
+        if remaining.len() == shadow.sources.len() {
+            // No sources merged — nothing to do
+            continue;
+        }
+
+        if remaining.len() <= 1 {
+            // All (or all but one) sources merged — dissolve the shadow
+            let new_parent = remaining.first().map(|s| s.as_str()).unwrap_or(trunk);
+            utils::print_info(&format!(
+                "Dissolving shadow '{}' — reparenting '{}' to '{}'",
+                shadow_name, shadow.consumer, new_parent
+            ));
+
+            // Delete shadow branch (local + remote)
+            if git
+                .get_commit_hash(&format!("refs/heads/{shadow_name}"))
+                .is_ok()
+            {
+                let current = git.current_branch()?;
+                if current == *shadow_name {
+                    git.checkout_branch(new_parent)?;
+                }
+                let _ = git.delete_branch(shadow_name, true);
+            }
+
+            // Rebase consumer onto new parent immediately.
+            // We must do this now (not defer to the later restack step) because
+            // the consumer is currently based on the shadow's merge commit.
+            // A `--onto` rebase later would use the wrong base and try to
+            // replay the merge commit.
+            utils::print_info(&format!(
+                "Rebasing '{}' onto '{}'",
+                shadow.consumer, new_parent
+            ));
+            git.rebase_onto(&shadow.consumer, new_parent)?;
+
+            // Update cache: remove shadow entry, update consumer parent
+            cache.remove_shadow(shadow_name);
+            let consumer_tip = git
+                .get_commit_hash(&format!("refs/heads/{}", shadow.consumer))
+                .unwrap_or_default();
+            if let Some(data) = cache.data_mut() {
+                if let Some(branch) = data.branches.get_mut(&shadow.consumer) {
+                    branch.parent = Some(new_parent.to_string());
+                    branch.merge_sources.clear();
+                    branch.tip = consumer_tip;
+                }
+                data.branches.remove(shadow_name);
+            }
+            cache.save_current();
+
+            utils::print_success(&format!("Shadow '{}' dissolved", shadow_name));
+        } else {
+            // Some sources merged but 2+ remain — recreate the shadow
+            utils::print_info(&format!(
+                "Recreating shadow '{}' with remaining sources: {:?}",
+                shadow_name, remaining
+            ));
+            let source_refs: Vec<&str> = remaining.iter().map(|s| s.as_str()).collect();
+            git.recreate_shadow_branch(shadow_name, &source_refs)?;
+
+            // Update cache
+            let shadow_tip = git.get_commit_hash(&format!("refs/heads/{shadow_name}"))?;
+            cache.upsert_shadow(
+                shadow_name,
+                crate::cache::ShadowBranch {
+                    consumer: shadow.consumer.clone(),
+                    sources: remaining.clone(),
+                    tip: shadow_tip,
+                },
+            );
+            if let Some(data) = cache.data_mut() {
+                if let Some(branch) = data.branches.get_mut(&shadow.consumer) {
+                    branch.merge_sources = remaining;
+                }
+            }
+            cache.save_current();
+        }
+    }
+
+    Ok(())
 }
 
 /// Compute the depth of a branch in the stack (distance from root).

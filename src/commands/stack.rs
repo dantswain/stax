@@ -122,11 +122,32 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // Build source-to-consumer lookup for merge annotations
+    let mut source_to_consumers: HashMap<String, Vec<String>> = HashMap::new();
+    for branch in stack.branches.values() {
+        if branch.merge_sources.len() > 1 {
+            // Skip the first source (it's the primary parent shown in tree structure)
+            for source in &branch.merge_sources[1..] {
+                source_to_consumers
+                    .entry(source.clone())
+                    .or_default()
+                    .push(branch.name.clone());
+            }
+        }
+    }
+
     println!("{}", "Stack Visualization".bold().underline());
     println!();
 
     let mut visited = HashSet::new();
-    print_stack_tree(&stack, root, 0, &mut visited, &in_scope);
+    print_stack_tree(
+        &stack,
+        root,
+        0,
+        &mut visited,
+        &in_scope,
+        &source_to_consumers,
+    );
 
     Ok(())
 }
@@ -137,8 +158,22 @@ fn print_stack_tree(
     depth: usize,
     visited: &mut HashSet<String>,
     in_scope: &HashSet<String>,
+    source_to_consumers: &HashMap<String, Vec<String>>,
 ) {
+    use crate::commands::navigate::is_shadow_branch;
+
     if !in_scope.contains(branch_name) {
+        return;
+    }
+
+    // Skip shadow branches from display
+    if is_shadow_branch(branch_name) {
+        // But still render their children (the consumer branch)
+        if let Some(branch) = stack.branches.get(branch_name) {
+            for child in &branch.children {
+                print_stack_tree(stack, child, depth, visited, in_scope, source_to_consumers);
+            }
+        }
         return;
     }
 
@@ -162,6 +197,23 @@ fn print_stack_tree(
 
         let mut line = format!("{}{}{}", indent, connector, branch.name);
 
+        // Show merge annotation if this branch has merge sources
+        if !branch.merge_sources.is_empty() {
+            let other_sources: Vec<&str> = branch
+                .merge_sources
+                .iter()
+                .skip(1) // first source is the primary parent, shown by tree structure
+                .map(|s| s.as_str())
+                .collect();
+            if !other_sources.is_empty() {
+                line = format!(
+                    "{} {}",
+                    line,
+                    format!("[+{}]", other_sources.join(", ")).dimmed()
+                );
+            }
+        }
+
         if branch.is_current {
             line = format!("{} {}", line.green().bold(), "← current".dimmed());
         }
@@ -182,8 +234,38 @@ fn print_stack_tree(
 
         println!("{line}");
 
+        // Render consumers from other sources (branches that include this one)
+        if let Some(consumers) = source_to_consumers.get(branch_name) {
+            for consumer in consumers {
+                if !visited.contains(consumer) && in_scope.contains(consumer) {
+                    if let Some(cb) = stack.branches.get(consumer) {
+                        let other_sources: Vec<&str> = cb
+                            .merge_sources
+                            .iter()
+                            .filter(|s| s.as_str() != branch_name)
+                            .map(|s| s.as_str())
+                            .collect();
+                        let annotation = if other_sources.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {}", format!("[+{}]", other_sources.join(", ")).dimmed())
+                        };
+                        let consumer_indent = "  ".repeat(depth + 1);
+                        println!("{}├─ {}{}", consumer_indent, consumer.dimmed(), annotation);
+                    }
+                }
+            }
+        }
+
         for child in &branch.children {
-            print_stack_tree(stack, child, depth + 1, visited, in_scope);
+            print_stack_tree(
+                stack,
+                child,
+                depth + 1,
+                visited,
+                in_scope,
+                source_to_consumers,
+            );
         }
 
         visited.remove(branch_name);

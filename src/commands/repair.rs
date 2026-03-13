@@ -103,6 +103,10 @@ pub async fn do_repair(git: &GitRepo, check: bool, prs: &[PullRequest]) -> Resul
     let sorted = topological_sort(&expected_parents);
 
     for (branch, expected_parent) in &sorted {
+        // Skip shadow branches — they are managed by `include`
+        if crate::commands::navigate::is_shadow_branch(branch) {
+            continue;
+        }
         let current_parent = parent_map
             .get(branch)
             .and_then(|p| p.clone())
@@ -285,9 +289,12 @@ pub fn check_topology_from_cache(
         }
     }
 
-    // Compare against current parent_map
+    // Compare against current parent_map (skip shadow branches)
     let mut mismatches = Vec::new();
     for (branch, expected_parent) in &expected_parents {
+        if crate::commands::navigate::is_shadow_branch(branch) {
+            continue;
+        }
         let current_parent = parent_map
             .get(branch)
             .and_then(|p| p.clone())
