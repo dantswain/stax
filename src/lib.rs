@@ -18,3 +18,11 @@ pub enum AuthCommands {
     #[command(about = "Show current authentication status")]
     Status,
 }
+
+#[derive(Clone, clap::ValueEnum)]
+pub enum InsertPosition {
+    /// Insert between current branch and its children (away from main)
+    Above,
+    /// Insert between current branch and its parent (toward main)
+    Below,
+}

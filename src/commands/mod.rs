@@ -2,6 +2,7 @@ pub mod auth;
 pub mod branch;
 pub mod config;
 pub mod include;
+pub mod insert;
 pub mod log;
 pub mod navigate;
 pub mod repair;

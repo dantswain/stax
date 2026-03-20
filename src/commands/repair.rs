@@ -276,17 +276,13 @@ pub fn check_topology_from_cache(
         return Vec::new();
     }
 
-    // Build expected parents from PR chain (same logic as do_repair)
+    // Build expected parents from PR chain — only branches with actual PRs.
+    // Gap branch inference is intentionally excluded here: inferred parents
+    // are speculative and should not block operations like restack.  The full
+    // `repair` command performs gap inference interactively when needed.
     let mut expected_parents: HashMap<String, String> = HashMap::new();
     for pr in &local_prs {
         expected_parents.insert(pr.head_ref.clone(), pr.base_ref.clone());
-    }
-
-    // Infer gap branch parents (silently — no interactive prompts)
-    if let Ok(inferred) = infer_gap_branch_parents_silent(&local_prs, &branch_set) {
-        for (branch, parent) in inferred {
-            expected_parents.insert(branch, parent);
-        }
     }
 
     // Compare against current parent_map (skip shadow branches)
@@ -324,7 +320,24 @@ async fn fetch_live_prs(git: &GitRepo) -> Result<Vec<PullRequest>> {
     utils::print_info("Fetching PR data from GitHub...");
     let prs = github.get_open_pull_requests().await?;
 
-    // Persist to cache
+    // Check for locally-modified base_refs that would be overwritten
+    let mut cache = StackCache::new(&git.git_dir());
+    cache.load();
+    let all_branches = git.get_branches()?;
+    if let Some(data) = cache.data_ref() {
+        for pr in &prs {
+            if let Some(cached_pr) = data.pull_requests.get(&pr.head_ref) {
+                if cached_pr.base_ref != pr.base_ref && all_branches.contains(&cached_pr.base_ref) {
+                    utils::print_warning(&format!(
+                        "PR #{} for '{}': local base '{}' will be overwritten with GitHub's '{}'",
+                        pr.number, pr.head_ref, cached_pr.base_ref, pr.base_ref
+                    ));
+                }
+            }
+        }
+    }
+
+    // Persist to cache (repair intentionally uses GitHub as source of truth)
     let cached: HashMap<String, CachedPullRequest> = prs
         .iter()
         .map(|pr| {
@@ -341,7 +354,6 @@ async fn fetch_live_prs(git: &GitRepo) -> Result<Vec<PullRequest>> {
             )
         })
         .collect();
-    let mut cache = StackCache::new(&git.git_dir());
     cache.save_pull_requests(&cached);
 
     log::debug!("repair: fetched {} open PRs", prs.len());
@@ -473,62 +485,6 @@ pub(crate) fn infer_gap_branch_parents(
                 result.insert(gap.to_string(), parent.to_string());
             }
         }
-    }
-
-    Ok(result)
-}
-
-/// Silent version of `infer_gap_branch_parents` for use in `check_topology_from_cache`.
-/// Only returns single-candidate inferences (no interactive prompts, no warnings).
-fn infer_gap_branch_parents_silent(
-    prs: &[&PullRequest],
-    branch_set: &HashSet<&str>,
-) -> Result<HashMap<String, String>> {
-    let head_refs: HashSet<&str> = prs.iter().map(|pr| pr.head_ref.as_str()).collect();
-    let base_refs: HashSet<&str> = prs.iter().map(|pr| pr.base_ref.as_str()).collect();
-
-    let chain_tails: HashSet<&str> = head_refs
-        .iter()
-        .filter(|h| !base_refs.contains(*h))
-        .copied()
-        .collect();
-
-    let gap_branches: Vec<&str> = base_refs
-        .iter()
-        .filter(|b| {
-            !head_refs.contains(*b) && !MAIN_BRANCHES.contains(b) && branch_set.contains(*b)
-        })
-        .copied()
-        .collect();
-
-    if gap_branches.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let base_to_heads: HashMap<&str, Vec<&str>> = {
-        let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
-        for pr in prs {
-            map.entry(pr.base_ref.as_str())
-                .or_default()
-                .push(pr.head_ref.as_str());
-        }
-        map
-    };
-
-    let mut result = HashMap::new();
-
-    for gap in &gap_branches {
-        let descendants = collect_descendants(gap, &base_to_heads);
-        let candidates: Vec<&str> = chain_tails
-            .iter()
-            .filter(|t| !descendants.contains(*t))
-            .copied()
-            .collect();
-
-        if candidates.len() == 1 {
-            result.insert(gap.to_string(), candidates[0].to_string());
-        }
-        // Skip 0 and multi-candidate cases silently
     }
 
     Ok(result)

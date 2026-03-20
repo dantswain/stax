@@ -224,6 +224,16 @@ stax restack --all
 # Continue restack after resolving rebase conflicts
 stax restack --continue
 
+# Insert a new branch into the stack (between current and its children)
+stax insert above new-branch
+
+# Insert a new branch into the stack (between current and its parent)
+stax insert below new-branch
+
+# Reparent an existing branch above/below current
+stax insert above existing-branch
+stax insert below existing-branch
+
 # Include another branch as a merge dependency (diamond merge)
 stax include other-branch
 
@@ -427,7 +437,7 @@ cargo fmt
 
 ## Testing Coverage
 
-The project includes 223 tests across unit and integration suites:
+The project includes 254 tests across unit and integration suites:
 
 - **Unit Tests** (92 tests, in-module `#[cfg(test)]`):
   - `cache.rs` — Cache roundtrip, schema validation, restack state persistence, branch upsert, PR data, shadow branch helpers
@@ -440,10 +450,11 @@ The project includes 223 tests across unit and integration suites:
   - `utils.rs` — String truncation edge cases
   - `oauth.rs` — Client creation, request structure validation
 
-- **Integration Tests** (131 tests, `tests/`):
-  - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (26 tests using temp repos with bare remote origins)
+- **Integration Tests** (162 tests, `tests/`):
+  - `git_test.rs` — Branch create/checkout, merge-base, is_clean, tracking, remote operations (29 tests using temp repos with bare remote origins)
   - `navigate_test.rs` — Parent detection, cache warm/cold/partial hits, PR overrides, topological walking, merged branch handling, fork detection (61 tests)
-  - `include_test.rs` — Shadow branch creation/replacement/conflict resolution/continue, is_shadow_branch, parent/children exclusion, children_from_map resolution, cache roundtrip, build_parent_map skipping (12 tests)
+  - `include_test.rs` — Shadow branch creation/replacement/conflict resolution/continue, is_shadow_branch, parent/children exclusion, children_from_map resolution, cache roundtrip, build_parent_map skipping (21 tests)
+  - `insert_test.rs` — Insert above/below: create new branches, reparent existing branches, PR base_ref updates, diamond child source updates, self-insert guard, parent confirmation (19 tests)
   - `stack_test.rs` — `Stack::analyze` and `Stack::from_parent_map` with various topologies: linear, branching, diamond, PR overrides (14 async tests)
   - `repair_test.rs` — Topology mismatch detection, gap branch inference, topological sorting (12 tests)
   - `restack_test.rs` — `rebase_onto` simple/noop/conflict/full-stack/branch-preservation (5 tests)
@@ -460,6 +471,7 @@ src/
 │   ├── branch.rs        # Branch creation
 │   ├── config.rs        # Configuration management
 │   ├── include.rs       # Diamond merge (stax include)
+│   ├── insert.rs        # Insert branch into stack (stax insert above/below)
 │   ├── navigate.rs      # Stack navigation + parent detection + cache integration
 │   ├── repair.rs        # Topology repair using PR data as source of truth
 │   ├── restack.rs       # Branch restacking
@@ -480,6 +492,7 @@ tests/
 ├── common/mod.rs        # Shared test helpers (temp repo creation)
 ├── git_test.rs          # Git operations integration tests
 ├── include_test.rs      # Diamond merge / shadow branch integration tests
+├── insert_test.rs       # Insert branch into stack integration tests
 ├── navigate_test.rs     # Navigation, cache, and parent detection tests
 ├── repair_test.rs       # Topology repair integration tests
 ├── restack_test.rs      # Rebase integration tests

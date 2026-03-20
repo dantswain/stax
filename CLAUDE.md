@@ -70,6 +70,7 @@ All commands follow this pattern:
 - `stax sync [--no-restack] [--force] [--continue] [--metadata-only]` - Fetch, fast-forward trunk, clean up merged branches, restack
 - `stax restack [--all] [--continue]` - Rebase branches on parents
 - `stax repair [--check] [--continue]` - Fix branch topology using PR data as source of truth
+- `stax insert <above|below> [name]` - Insert a new branch into the stack; `above` inserts between current and children, `below` inserts between current and parent
 - `stax up` / `stax down` / `stax top` / `stax bottom` - Navigate the stack
 - `stax status` - Show current repository status
 - `stax config set/get/list` - Configuration management

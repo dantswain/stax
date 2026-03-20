@@ -3,7 +3,7 @@ use std::process;
 
 use stax::commands;
 use stax::commands::*;
-use stax::AuthCommands;
+use stax::{AuthCommands, InsertPosition};
 
 #[derive(Parser)]
 #[command(name = "stax")]
@@ -60,6 +60,18 @@ enum Commands {
         check: bool,
         #[arg(long, help = "Continue after resolving rebase conflicts")]
         r#continue: bool,
+    },
+    #[command(about = "Insert a new branch into the stack")]
+    Insert {
+        #[arg(
+            value_enum,
+            help = "Where to insert: 'above' (between current and children) or 'below' (between current and parent)"
+        )]
+        position: InsertPosition,
+        #[arg(help = "Name of the new branch")]
+        name: Option<String>,
+        #[arg(short, long, help = "Skip confirmation prompts")]
+        force: bool,
     },
     #[command(about = "Include another branch as a merge dependency")]
     Include {
@@ -146,6 +158,11 @@ async fn main() {
         } => sync::run(no_restack, force, r#continue, metadata_only).await,
         Commands::Restack { all, r#continue } => restack::run(all, r#continue).await,
         Commands::Repair { check, r#continue } => repair::run(check, r#continue).await,
+        Commands::Insert {
+            position,
+            name,
+            force,
+        } => commands::insert::run(position, name.as_deref(), force).await,
         Commands::Include { branch, r#continue } => {
             commands::include::run(branch.as_deref(), r#continue).await
         }

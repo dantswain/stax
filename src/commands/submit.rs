@@ -172,38 +172,80 @@ async fn build_stack_from_metadata(git: &GitRepo, github: &GitHubClient) -> Resu
     // We then fetch LIVE PR data to override any stale cached relationships.
     let (branches, commits, merged, mut parent_map) = get_branches_and_parent_map(git)?;
 
-    // Fetch live PRs — their base_ref is the most authoritative parent source,
-    // superseding both merge-base heuristics and cached PR data.
+    // Fetch live PRs and apply as parent overrides, preserving locally-modified
+    // base_refs (e.g., from `stax insert` reparenting not yet submitted).
     let mut prs: HashMap<String, PullRequest> = HashMap::new();
     if let Ok(open_prs) = github.get_open_pull_requests().await {
+        // Load existing cached PR data to detect local modifications
+        let local_pr_bases: HashMap<String, String> = {
+            let mut c = StackCache::new(&git.git_dir());
+            c.load();
+            c.data_ref()
+                .map(|d| {
+                    d.pull_requests
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.base_ref.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
         for pr in open_prs {
-            if parent_map.contains_key(&pr.head_ref) && branches.contains(&pr.base_ref) {
-                let current = parent_map.get(&pr.head_ref).and_then(|p| p.as_ref());
-                if current != Some(&pr.base_ref) {
+            // Apply local base_ref overrides to the PARENT MAP only (not the PR
+            // object). The PR object keeps the live GitHub base_ref so that submit
+            // can detect when it needs to update the PR on GitHub.
+            let effective_base = if let Some(local_base) = local_pr_bases.get(&pr.head_ref) {
+                if *local_base != pr.base_ref && branches.contains(local_base) {
                     log::debug!(
-                        "submit: live PR #{} overrides parent of '{}': {:?} → '{}'",
-                        pr.number,
+                        "submit: local base_ref '{}' for '{}' (live: '{}')",
+                        local_base,
                         pr.head_ref,
-                        current,
                         pr.base_ref
                     );
-                    parent_map.insert(pr.head_ref.clone(), Some(pr.base_ref.clone()));
+                    local_base.clone()
+                } else {
+                    pr.base_ref.clone()
+                }
+            } else {
+                pr.base_ref.clone()
+            };
+
+            if parent_map.contains_key(&pr.head_ref) && branches.contains(&effective_base) {
+                let current = parent_map.get(&pr.head_ref).and_then(|p| p.as_ref());
+                if current != Some(&effective_base) {
+                    log::debug!(
+                        "submit: overriding parent of '{}': {:?} → '{}'",
+                        pr.head_ref,
+                        current,
+                        effective_base
+                    );
+                    parent_map.insert(pr.head_ref.clone(), Some(effective_base.clone()));
                 }
             }
             prs.insert(pr.head_ref.clone(), pr);
         }
 
-        // Persist live PR metadata to cache so other commands use fresh data
+        // Persist PR metadata to cache with locally-modified base_refs preserved
+        // (so other commands like sync/restack see the correct local state).
         let cached_prs: HashMap<String, CachedPullRequest> = prs
             .iter()
             .map(|(k, pr)| {
+                let base_ref = if let Some(local_base) = local_pr_bases.get(k) {
+                    if *local_base != pr.base_ref && branches.contains(local_base) {
+                        local_base.clone()
+                    } else {
+                        pr.base_ref.clone()
+                    }
+                } else {
+                    pr.base_ref.clone()
+                };
                 (
                     k.clone(),
                     CachedPullRequest {
                         number: pr.number,
                         state: pr.state.clone(),
                         head_ref: pr.head_ref.clone(),
-                        base_ref: pr.base_ref.clone(),
+                        base_ref,
                         html_url: pr.html_url.clone(),
                         draft: pr.draft,
                     },

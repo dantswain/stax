@@ -263,14 +263,16 @@ async fn test_repair_skips_nonlocal_pr_branches() {
 // ── check_topology_from_cache tests ─────────────────────────────────────────
 
 #[test]
-fn test_check_topology_detects_gap_branch_mismatch() {
-    // Same setup as gap branch test — check_topology_from_cache should
-    // detect the mismatch without modifying anything.
+fn test_check_topology_skips_gap_branches() {
+    // Gap branches (branches without PRs that appear as PR bases) should
+    // NOT be flagged by the topology check.  Gap inference is speculative
+    // and can produce false positives (e.g., after `stax insert`).  The
+    // full `repair` command handles gap branches interactively.
     let (dir, repo) = create_test_repo();
     let p = dir.path();
 
     create_branch_with_commit(p, "tail", "main");
-    // gap branched off main (wrong — should be on tail per PR chain)
+    // gap branched off main — has no PR
     create_branch_with_commit(p, "gap", "main");
     create_branch_with_commit(p, "child", "gap");
 
@@ -278,20 +280,17 @@ fn test_check_topology_detects_gap_branch_mismatch() {
     let _ = get_branches_and_parent_map(&repo).unwrap();
 
     // Write PR cache: tail→main, child→gap
-    // gap has no PR → inferred parent = tail
+    // gap has no PR → should NOT be flagged by topology check
     write_pr_cache(&repo, vec![("tail", "main", 1), ("child", "gap", 2)]);
 
     let (_, _, _, parent_map) = get_branches_and_parent_map(&repo).unwrap();
     let mismatches = check_topology_from_cache(&repo, &parent_map);
 
+    // Gap branch should not cause a mismatch — only branches with actual
+    // PRs should be checked.
     assert!(
-        !mismatches.is_empty(),
-        "should detect gap branch topology mismatch"
-    );
-    // The mismatch should be for "gap"
-    assert!(
-        mismatches.iter().any(|(branch, _, _)| branch == "gap"),
-        "mismatch should be for gap branch, got: {:?}",
+        !mismatches.iter().any(|(branch, _, _)| branch == "gap"),
+        "gap branch without PR should not be flagged, got: {:?}",
         mismatches
     );
 }
@@ -394,15 +393,14 @@ async fn test_restack_blocks_on_topology_issues() {
     // that creates a mismatch detectable by check_topology_from_cache
 }
 
-#[tokio::test]
-async fn test_restack_blocks_on_gap_branch_topology() {
-    // More targeted test: gap branch topology issue should be detectable
-    // and would block restack in practice.
+#[test]
+fn test_restack_does_not_block_on_gap_branch() {
+    // Gap branches (no PR) should not block restack.  The topology check
+    // only flags branches with actual PR mismatches.
     let (dir, repo) = create_test_repo();
     let p = dir.path();
 
     create_branch_with_commit(p, "tail", "main");
-    // gap branched off main (wrong — should be on tail per PR chain)
     create_branch_with_commit(p, "gap", "main");
     create_branch_with_commit(p, "child", "gap");
 
@@ -410,18 +408,16 @@ async fn test_restack_blocks_on_gap_branch_topology() {
     let _ = get_branches_and_parent_map(&repo).unwrap();
 
     // Write PR cache: tail→main, child→gap
-    // gap has no PR → topology check should detect mismatch
+    // gap has no PR → should NOT block restack
     write_pr_cache(&repo, vec![("tail", "main", 1), ("child", "gap", 2)]);
 
     let (_, _, _, parent_map) = get_branches_and_parent_map(&repo).unwrap();
     let mismatches = check_topology_from_cache(&repo, &parent_map);
 
+    // gap branch should not be flagged
     assert!(
-        !mismatches.is_empty(),
-        "should detect gap branch topology mismatch that would block restack"
-    );
-    assert!(
-        mismatches.iter().any(|(branch, _, _)| branch == "gap"),
-        "mismatch should be for gap branch"
+        !mismatches.iter().any(|(branch, _, _)| branch == "gap"),
+        "gap branch without PR should not block restack, got: {:?}",
+        mismatches
     );
 }
