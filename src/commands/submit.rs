@@ -508,14 +508,19 @@ fn format_stack_line(
 ) -> String {
     let indent = "&nbsp;&nbsp;".repeat(depth);
     let icon = status_icon(pr);
+    let title_suffix = if pr.title.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", pr.title)
+    };
     if is_current {
         format!(
-            "- {indent}{icon} **`{branch_name}` [#{}]({}) \u{2190} this PR**",
+            "- {indent}{icon} **`{branch_name}` [#{}]({}){title_suffix} \u{2190} this PR**",
             pr.number, pr.html_url
         )
     } else {
         format!(
-            "- {indent}{icon} `{branch_name}` [#{}]({})",
+            "- {indent}{icon} `{branch_name}` [#{}]({}){title_suffix}",
             pr.number, pr.html_url
         )
     }
@@ -992,5 +997,43 @@ mod tests {
         assert!(items[1].contains("&nbsp;&nbsp;") && items[1].contains("`D`"));
         assert!(!items[2].contains("&nbsp;&nbsp;") && items[2].contains("**`A`"));
         assert!(!comment.contains("`B`"));
+    }
+
+    // ---- PR title in comment ----
+
+    #[test]
+    fn test_pr_title_in_comment() {
+        let stack = make_linear_stack();
+        let comment = render_stack_comment(&stack, 2);
+        // Each PR line should include the title (make_pr sets "PR for {branch}")
+        assert!(comment.contains("— PR for C"), "should contain title for C");
+        assert!(comment.contains("— PR for B"), "should contain title for B");
+        assert!(comment.contains("— PR for A"), "should contain title for A");
+    }
+
+    #[test]
+    fn test_pr_title_empty_omitted() {
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["feat"], None),
+        );
+        let mut pr = make_pr(1, "feat");
+        pr.title = String::new();
+        branches.insert(
+            "feat".to_string(),
+            make_branch("feat", Some("main"), vec![], Some(pr)),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "feat".to_string(),
+        };
+        let comment = render_stack_comment(&stack, 1);
+        // Should not contain the " — " separator when title is empty
+        assert!(
+            !comment.contains(" — "),
+            "empty title should not produce separator"
+        );
     }
 }
