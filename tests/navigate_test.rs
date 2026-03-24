@@ -5,7 +5,7 @@ use stax::cache::{CachedPullRequest, StackCache};
 use stax::commands::navigate::{
     build_commit_cache, build_parent_map, children_from_map, find_children, find_parent,
     get_branches_and_parent_map, get_branches_with_cache, is_active_stack, is_main_branch,
-    root_children_from_map, walk_to_top,
+    needs_restack, root_children_from_map, walk_to_top,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1544,4 +1544,97 @@ fn test_cache_updated_after_get_branches_and_parent_map() {
         Some("main")
     );
     assert_eq!(data.branches.get("B").unwrap().parent.as_deref(), Some("A"));
+}
+
+// ── needs_restack ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_needs_restack_false_when_up_to_date() {
+    // main → A → B — all branches properly stacked, no restack needed
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+    let _ = (&branches, &merged);
+
+    assert!(!needs_restack(&repo, "A", &parent_map, &commits));
+    assert!(!needs_restack(&repo, "B", &parent_map, &commits));
+}
+
+#[test]
+fn test_needs_restack_true_when_parent_moved() {
+    // main → A → B, then add a new commit to A — B needs restacking.
+    // We supply a manual parent_map with B→A to simulate the real scenario
+    // where a PR override or cache preserves the parent even after A moved.
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+
+    // Add a commit to A after B was branched
+    git(p, &["checkout", "A"]);
+    add_commit(p, "new-on-A.txt", "new commit on A");
+
+    // Build fresh commits map but override parent_map to keep B→A
+    let commits = build_commit_cache(&repo, &["main", "A", "B"].map(String::from)).unwrap();
+    let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+    parent_map.insert("A".to_string(), Some("main".to_string()));
+    parent_map.insert("B".to_string(), Some("A".to_string()));
+
+    assert!(
+        !needs_restack(&repo, "A", &parent_map, &commits),
+        "A is based on main, which hasn't moved"
+    );
+    assert!(
+        needs_restack(&repo, "B", &parent_map, &commits),
+        "B should need restacking because A moved"
+    );
+}
+
+#[test]
+fn test_needs_restack_false_for_main_branch() {
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    let (_, commits, _, parent_map) = get_branches_and_parent_map(&repo).unwrap();
+
+    assert!(!needs_restack(&repo, "main", &parent_map, &commits));
+}
+
+#[test]
+fn test_needs_restack_deep_stack_only_affected_branch() {
+    // main → A → B → C, then move A — B needs restack but C doesn't
+    // (C is still based on B's unchanged tip)
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "A");
+    create_branch_with_commit(p, "C", "B");
+
+    // Move A forward
+    git(p, &["checkout", "A"]);
+    add_commit(p, "new-on-A.txt", "new commit on A");
+
+    // Build fresh commits but keep explicit parent relationships
+    let commits = build_commit_cache(&repo, &["main", "A", "B", "C"].map(String::from)).unwrap();
+    let mut parent_map: HashMap<String, Option<String>> = HashMap::new();
+    parent_map.insert("A".to_string(), Some("main".to_string()));
+    parent_map.insert("B".to_string(), Some("A".to_string()));
+    parent_map.insert("C".to_string(), Some("B".to_string()));
+
+    assert!(!needs_restack(&repo, "A", &parent_map, &commits));
+    assert!(
+        needs_restack(&repo, "B", &parent_map, &commits),
+        "B needs restacking because A moved"
+    );
+    assert!(
+        !needs_restack(&repo, "C", &parent_map, &commits),
+        "C doesn't need restacking because B hasn't moved"
+    );
 }

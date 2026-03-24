@@ -1069,6 +1069,48 @@ fn recompute_parents(
     Ok(out)
 }
 
+/// Check whether a branch needs restacking on its parent.
+/// A branch needs restacking when its parent's tip is not an ancestor of the
+/// branch — i.e., the parent has moved since the branch was last rebased.
+/// Returns `false` for main branches or branches without a known parent.
+pub fn needs_restack(
+    git: &GitRepo,
+    branch: &str,
+    parent_map: &HashMap<String, Option<String>>,
+    commits: &HashMap<String, String>,
+) -> bool {
+    if is_main_branch(branch) {
+        return false;
+    }
+    let parent = match parent_map.get(branch).and_then(|p| p.as_ref()) {
+        Some(p) => p,
+        None => return false,
+    };
+    let parent_tip = match commits.get(parent.as_str()) {
+        Some(tip) => tip,
+        None => return false,
+    };
+    let mb = match git.get_merge_base(branch, parent) {
+        Ok(mb) => mb.to_string(),
+        Err(_) => return false,
+    };
+    mb != *parent_tip
+}
+
+/// Check whether a branch needs restacking and print a warning if so.
+fn warn_if_needs_restack(
+    git: &GitRepo,
+    branch: &str,
+    parent_map: &HashMap<String, Option<String>>,
+    commits: &HashMap<String, String>,
+) {
+    if needs_restack(git, branch, parent_map, commits) {
+        let parent = parent_map[branch].as_ref().unwrap();
+        utils::print_warning(&format!("'{}' needs restacking on '{}'", branch, parent));
+        utils::print_info("Run 'stax restack' to rebase onto the latest parent");
+    }
+}
+
 pub async fn down() -> Result<()> {
     let git = GitRepo::open(".")?;
     let current = git.current_branch()?;
@@ -1109,6 +1151,7 @@ pub async fn down() -> Result<()> {
             };
             git.checkout_branch(&target)?;
             utils::print_success(&format!("Moved down to {}", target));
+            warn_if_needs_restack(&git, &target, &parent_map, &commits);
             return Ok(());
         }
     }
@@ -1116,6 +1159,7 @@ pub async fn down() -> Result<()> {
     log::debug!("navigate down: target='{}'", parent);
     git.checkout_branch(&parent)?;
     utils::print_success(&format!("Moved down to {}", parent));
+    warn_if_needs_restack(&git, &parent, &parent_map, &commits);
     Ok(())
 }
 
@@ -1152,6 +1196,7 @@ pub async fn up() -> Result<()> {
     log::debug!("navigate up: target='{}'", target);
     git.checkout_branch(&target)?;
     utils::print_success(&format!("Moved up to {}", target));
+    warn_if_needs_restack(&git, &target, &parent_map, &commits);
     Ok(())
 }
 
@@ -1171,6 +1216,7 @@ pub async fn bottom() -> Result<()> {
             1 => {
                 git.checkout_branch(&children[0])?;
                 utils::print_success(&format!("Moved to bottom of stack: {}", children[0]));
+                warn_if_needs_restack(&git, &children[0], &parent_map, &commits);
                 Ok(())
             }
             _ => {
@@ -1189,6 +1235,7 @@ pub async fn bottom() -> Result<()> {
                 )?;
                 git.checkout_branch(&target)?;
                 utils::print_success(&format!("Moved to bottom of stack: {}", target));
+                warn_if_needs_restack(&git, &target, &parent_map, &commits);
                 Ok(())
             }
         };
@@ -1219,6 +1266,7 @@ pub async fn bottom() -> Result<()> {
 
     git.checkout_branch(&target)?;
     utils::print_success(&format!("Moved to bottom of stack: {}", target));
+    warn_if_needs_restack(&git, &target, &parent_map, &commits);
     Ok(())
 }
 
@@ -1363,5 +1411,6 @@ pub async fn top() -> Result<()> {
 
     git.checkout_branch(&target)?;
     utils::print_success(&format!("Moved to top of stack: {}", target));
+    warn_if_needs_restack(&git, &target, &parent_map, &commits);
     Ok(())
 }
