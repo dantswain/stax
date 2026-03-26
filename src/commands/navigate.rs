@@ -852,20 +852,57 @@ pub fn get_branches_and_parent_map(
                 }
             }
 
-            // Identify branches needing recompute
+            // Carry forward cached parents for stale branches.  A stale
+            // branch was rebased/amended — the parent relationship is still
+            // correct, the branch just needs restacking.  Recomputing via
+            // the merge-base heuristic would often give the wrong answer
+            // because the branch hasn't been restacked onto its parent yet.
+            {
+                let data = cache.data_ref().unwrap();
+                for name in &validation.stale {
+                    if !merged.contains(name) {
+                        if let Some(cached) = data.branches.get(name) {
+                            log::debug!(
+                                "cache: {} is stale, preserving cached parent {:?}",
+                                name,
+                                cached.parent
+                            );
+                            parent_map.insert(name.clone(), cached.parent.clone());
+                        }
+                    }
+                }
+            }
+
+            // Only recompute truly new branches (never seen before) and
+            // branches whose cached parent was deleted.
             let mut needs_recompute: HashSet<String> = HashSet::new();
-            needs_recompute.extend(validation.stale.iter().cloned());
             needs_recompute.extend(validation.new_branches.iter().cloned());
-            // Also recompute branches whose cached parent is stale or deleted
+            // Check all cached branches for deleted parents
             for (name, cached) in &validation.valid {
                 if let Some(ref parent) = cached.parent {
-                    if validation.stale.contains(parent) || validation.deleted.contains(parent) {
+                    if validation.deleted.contains(parent) {
                         log::debug!(
-                            "cache: {} needs recompute (parent {} is stale/deleted)",
+                            "cache: {} needs recompute (parent {} was deleted)",
                             name,
                             parent,
                         );
                         needs_recompute.insert(name.clone());
+                    }
+                }
+            }
+            if let Some(data) = cache.data_ref() {
+                for name in &validation.stale {
+                    if let Some(cached) = data.branches.get(name) {
+                        if let Some(ref parent) = cached.parent {
+                            if validation.deleted.contains(parent) {
+                                log::debug!(
+                                    "cache: {} needs recompute (parent {} was deleted)",
+                                    name,
+                                    parent,
+                                );
+                                needs_recompute.insert(name.clone());
+                            }
+                        }
                     }
                 }
             }

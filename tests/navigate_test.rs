@@ -1081,13 +1081,12 @@ fn test_cache_with_merged_branch() {
 }
 
 #[test]
-fn test_cache_stale_parent_triggers_child_recompute() {
-    // If A's tip changes, B (whose cached parent is A) should also be
-    // recomputed because its parent relationship may have changed.
-    //
-    // When A advances without restacking B, B's closest ancestor branch
-    // becomes main (A's tip is no longer in B's ancestry). This is correct
-    // behavior — B would need restacking to be back on top of A.
+fn test_cache_stale_parent_preserves_child_relationship() {
+    // If A's tip changes (e.g., after rebase), B's cached parent should
+    // remain A.  The parent relationship is still correct — B just needs
+    // restacking onto the new A.  Recomputing via the merge-base heuristic
+    // would incorrectly assign B's parent to main because A's tip is no
+    // longer in B's ancestry.
     let (dir, repo) = create_test_repo();
     let p = dir.path();
 
@@ -1100,17 +1099,16 @@ fn test_cache_stale_parent_triggers_child_recompute() {
     assert_eq!(pm1.get("B").unwrap().as_deref(), Some("A"));
     assert_eq!(pm1.get("C").unwrap().as_deref(), Some("B"));
 
-    // Advance A (makes A stale, which should also trigger B recompute)
+    // Advance A (makes A stale)
     git(p, &["checkout", "A"]);
     add_commit(p, "A_extra.txt", "extra commit on A");
 
-    // Second call: partial hit — A is stale, B should be recomputed
-    // because its cached parent (A) is stale.
+    // Second call: partial hit — A is stale, but B's parent should be
+    // preserved as A (not recomputed to main).
     let (_b2, _c2, _m2, pm2) = get_branches_and_parent_map(&repo).unwrap();
     assert_eq!(pm2.get("A").unwrap().as_deref(), Some("main"));
-    // B's parent changes to main because A's tip has moved past B's
-    // branch point (A advanced without restacking B)
-    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("main"));
+    // B keeps its cached parent A — it needs restacking, not reparenting
+    assert_eq!(pm2.get("B").unwrap().as_deref(), Some("A"));
     assert_eq!(pm2.get("C").unwrap().as_deref(), Some("B"));
 }
 
