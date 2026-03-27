@@ -4,7 +4,7 @@ use crate::commands::navigate::{
 use crate::git::GitRepo;
 use crate::github::{GitHubClient, PullRequest};
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct StackBranch {
@@ -608,10 +608,12 @@ impl Stack {
 
     pub fn get_stack_for_branch(&self, branch_name: &str) -> Vec<&StackBranch> {
         let mut stack = Vec::new();
-        let mut current = branch_name;
 
+        // Walk up to find the ancestor chain: [branch_name, parent, ..., root]
+        let mut ancestor_chain = Vec::new();
+        let mut current = branch_name;
         while let Some(branch) = self.branches.get(current) {
-            stack.push(branch);
+            ancestor_chain.push(current);
             if let Some(parent) = &branch.parent {
                 current = parent;
             } else {
@@ -619,19 +621,35 @@ impl Stack {
             }
         }
 
-        stack.reverse();
-
-        let mut queue = vec![branch_name];
+        // Add root first
         let mut visited = HashSet::new();
-        visited.insert(branch_name);
+        if let Some(&root) = ancestor_chain.last() {
+            if let Some(branch) = self.branches.get(root) {
+                stack.push(branch);
+                visited.insert(root);
+            }
+        }
 
-        while let Some(current_branch) = queue.pop() {
+        // BFS from the stack entry point (child of root in ancestor chain)
+        // to capture all branches in the connected stack, not just the
+        // direct chain through branch_name.
+        let bfs_start = if ancestor_chain.len() >= 2 {
+            ancestor_chain[ancestor_chain.len() - 2]
+        } else {
+            branch_name
+        };
+
+        let mut queue = VecDeque::new();
+        queue.push_back(bfs_start);
+        visited.insert(bfs_start);
+
+        while let Some(current_branch) = queue.pop_front() {
             if let Some(branch) = self.branches.get(current_branch) {
+                stack.push(branch);
                 for child in &branch.children {
                     if !visited.contains(child.as_str()) {
                         visited.insert(child);
-                        stack.push(self.branches.get(child).unwrap());
-                        queue.push(child);
+                        queue.push_back(child);
                     }
                 }
             }

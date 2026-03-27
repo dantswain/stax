@@ -413,17 +413,7 @@ async fn create_new_pr(
 fn render_stack_comment(stack: &Stack, current_pr_number: u64) -> String {
     let current_branch = &stack.current_branch;
 
-    // Walk up to find the root of the stack (the base branch)
-    let mut root = current_branch.as_str();
-    while let Some(branch) = stack.branches.get(root) {
-        match &branch.parent {
-            Some(parent) => root = parent,
-            None => break,
-        }
-    }
-    let base_branch = root;
-
-    // Collect ancestor chain: [current_branch, parent, ..., root]
+    // Walk up to find the ancestor chain: [current_branch, parent, ..., root]
     let mut ancestors = Vec::new();
     let mut cur = current_branch.as_str();
     while let Some(branch) = stack.branches.get(cur) {
@@ -434,26 +424,22 @@ fn render_stack_comment(stack: &Stack, current_pr_number: u64) -> String {
         }
     }
 
-    // Render descendants of current_branch as a tree (children before parent = reversed)
-    let mut body_lines = Vec::new();
-    if let Some(branch) = stack.branches.get(current_branch.as_str()) {
-        render_subtree(stack, branch, 0, current_pr_number, &mut body_lines);
-    }
+    let base_branch = ancestors
+        .last()
+        .map(|b| b.name.as_str())
+        .unwrap_or(current_branch.as_str());
 
-    // Render ancestor chain (parent → ... → root's first child), skipping current_branch
-    // and skipping the base branch itself (it goes in the footer)
-    for ancestor in &ancestors {
-        if ancestor.name == current_branch.as_str() {
-            continue;
-        }
-        if ancestor.name == base_branch && ancestor.pull_request.is_none() {
-            continue;
-        }
-        if let Some(pr) = &ancestor.pull_request {
-            let is_current = pr.number == current_pr_number;
-            body_lines.push(format_stack_line(&ancestor.name, pr, 0, is_current));
-        }
-    }
+    // Find the stack entry point: the first non-trunk ancestor (child of base_branch).
+    // Render the full tree from there so that all branches (including siblings in
+    // nonlinear stacks) appear in the comment.
+    let stack_top = if ancestors.len() >= 2 {
+        ancestors[ancestors.len() - 2]
+    } else {
+        ancestors[0]
+    };
+
+    let mut body_lines = Vec::new();
+    render_subtree(stack, stack_top, 0, current_pr_number, &mut body_lines);
 
     let mut result = vec![STACK_COMMENT_MARKER.to_string(), "### Stack".to_string()];
     result.extend(body_lines);
@@ -1009,6 +995,86 @@ mod tests {
         assert!(comment.contains("— PR for C"), "should contain title for C");
         assert!(comment.contains("— PR for B"), "should contain title for B");
         assert!(comment.contains("— PR for A"), "should contain title for A");
+    }
+
+    // ---- nonlinear stack: sibling branches visible from child ----
+
+    #[test]
+    fn test_nonlinear_sibling_visible_from_child() {
+        // main -> A(PR) -> B(PR), A -> C(PR), current_branch = B
+        // The comment rendered for any PR should include all of A, B, and C.
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B", "C"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec![], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("A"), vec![], Some(make_pr(3, "C"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "B".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 2);
+        let items = list_lines(&comment);
+
+        // All three branches should appear: B and C indented, A at depth 0
+        assert_eq!(items.len(), 3);
+        assert!(items[0].contains("`B`") && items[0].contains("&nbsp;&nbsp;"));
+        assert!(items[1].contains("`C`") && items[1].contains("&nbsp;&nbsp;"));
+        assert!(items[2].contains("`A`") && !items[2].contains("&nbsp;&nbsp;"));
+    }
+
+    #[test]
+    fn test_nonlinear_deep_sibling_visible() {
+        // main -> A(PR) -> B(PR) -> C(PR), B -> D(PR), current_branch = C
+        // Even from the deepest leaf, all branches should appear.
+        let mut branches = HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            make_branch("main", None, vec!["A"], None),
+        );
+        branches.insert(
+            "A".to_string(),
+            make_branch("A", Some("main"), vec!["B"], Some(make_pr(1, "A"))),
+        );
+        branches.insert(
+            "B".to_string(),
+            make_branch("B", Some("A"), vec!["C", "D"], Some(make_pr(2, "B"))),
+        );
+        branches.insert(
+            "C".to_string(),
+            make_branch("C", Some("B"), vec![], Some(make_pr(3, "C"))),
+        );
+        branches.insert(
+            "D".to_string(),
+            make_branch("D", Some("B"), vec![], Some(make_pr(4, "D"))),
+        );
+        let stack = Stack {
+            branches,
+            roots: vec!["main".to_string()],
+            current_branch: "C".to_string(),
+        };
+
+        let comment = render_stack_comment(&stack, 3);
+        let items = list_lines(&comment);
+
+        assert_eq!(items.len(), 4);
+        assert!(items[0].contains("`C`"));
+        assert!(items[1].contains("`D`"));
+        assert!(items[2].contains("`B`"));
+        assert!(items[3].contains("`A`"));
     }
 
     #[test]
