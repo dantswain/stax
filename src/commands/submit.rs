@@ -267,6 +267,36 @@ async fn build_stack_from_metadata(git: &GitRepo, github: &GitHubClient) -> Resu
     )
     .await?;
 
+    // Fetch individual PRs for stack branches not covered by the bulk fetch
+    // (which returns at most one page of results).
+    {
+        let main_branches = ["main", "master", "develop"];
+        let missing: Vec<_> = stack
+            .branches
+            .keys()
+            .filter(|b| !main_branches.contains(&b.as_str()) && !prs.contains_key(*b))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            log::debug!(
+                "submit: fetching individual PRs for {} branches not in bulk fetch",
+                missing.len()
+            );
+            let handles: Vec<_> = missing
+                .into_iter()
+                .map(|b| {
+                    let gh = github.clone();
+                    tokio::spawn(async move { gh.get_pr_for_branch(&b).await })
+                })
+                .collect();
+            for handle in handles {
+                if let Ok(Ok(Some(pr))) = handle.await {
+                    prs.insert(pr.head_ref.clone(), pr);
+                }
+            }
+        }
+    }
+
     // Inject PR data into the stack
     for (head_ref, pr) in &prs {
         if let Some(branch) = stack.branches.get_mut(head_ref) {
