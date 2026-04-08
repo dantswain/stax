@@ -1307,19 +1307,50 @@ pub async fn bottom() -> Result<()> {
     Ok(())
 }
 
-/// Spawn a background task to fetch open PR branch names from GitHub.
-/// Returns a JoinHandle so the caller can overlap git work with the network
-/// request.  Returns None if GitHub is unavailable (no token, no remote).
-fn spawn_open_pr_branches(
-    git: &GitRepo,
-) -> Option<tokio::task::JoinHandle<Option<HashSet<String>>>> {
-    let token = token_store::get_token()?;
-    let remote_url = git.get_remote_url("origin")?;
-    let client = GitHubClient::new(&token, &remote_url).ok()?;
-    Some(tokio::spawn(async move {
-        let prs = client.get_open_pull_requests().await.ok()?;
-        Some(prs.into_iter().map(|pr| pr.head_ref).collect())
-    }))
+/// Build the set of branches with open PRs from cached data.
+pub fn open_branches_from_cache(git: &GitRepo) -> Option<HashSet<String>> {
+    let mut cache = StackCache::new(&git.git_dir());
+    let data = cache.load()?;
+    let set: HashSet<String> = data
+        .pull_requests
+        .iter()
+        .filter(|(_, pr)| pr.state == "open")
+        .map(|(branch, _)| branch.clone())
+        .collect();
+    Some(set)
+}
+
+/// For branches that the cache says have no open PR, verify against the
+/// GitHub API with targeted per-branch queries.  Returns the branches
+/// confirmed to have an open PR (so they can be added to the set).
+async fn verify_missing_branches(git: &GitRepo, branches: &[String]) -> Vec<String> {
+    let client = match token_store::get_token()
+        .and_then(|t| git.get_remote_url("origin").map(|u| (t, u)))
+        .and_then(|(t, u)| GitHubClient::new(&t, &u).ok())
+    {
+        Some(c) => std::sync::Arc::new(c),
+        None => return Vec::new(),
+    };
+
+    let mut handles = Vec::new();
+    for branch in branches {
+        let client = client.clone();
+        let branch = branch.clone();
+        handles.push(tokio::spawn(async move {
+            match client.get_pr_for_branch(&branch).await {
+                Ok(Some(pr)) if pr.state == "open" => Some(branch),
+                _ => None,
+            }
+        }));
+    }
+
+    let mut confirmed = Vec::new();
+    for h in handles {
+        if let Ok(Some(branch)) = h.await {
+            confirmed.push(branch);
+        }
+    }
+    confirmed
 }
 
 /// Returns true if the stack (represented by its root and top) should be
@@ -1354,14 +1385,6 @@ pub async fn top() -> Result<()> {
     let current = git.current_branch()?;
     log::debug!("navigate top: current='{}'", current);
 
-    // Fire off GitHub API call immediately so it runs concurrently with
-    // the (potentially expensive) parent-map computation below.
-    let pr_handle = if is_main_branch(&current) {
-        spawn_open_pr_branches(&git)
-    } else {
-        None
-    };
-
     let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
 
     let ctx = BranchContext {
@@ -1387,11 +1410,36 @@ pub async fn top() -> Result<()> {
             roots.push(root.clone());
         }
 
-        // Await the GitHub API result (likely already finished by now)
-        let open_branches = match pr_handle {
-            Some(h) => h.await.ok().flatten(),
-            None => None,
-        };
+        // Use cached PR data optimistically, then verify misses via API
+        let mut open_branches = open_branches_from_cache(&git);
+
+        // Find single-branch stacks that the cache says have no open PR —
+        // they might have PRs that were never cached (e.g. created outside
+        // stax).  Verify these with targeted per-branch API calls.
+        if let Some(ref open) = open_branches {
+            let unconfirmed: Vec<String> = tops
+                .iter()
+                .zip(roots.iter())
+                .filter(|(top, root)| {
+                    root == top
+                        && children_from_map(root, &parent_map, &merged).len() <= 1
+                        && !open.contains(root.as_str())
+                })
+                .map(|(_, root)| root.clone())
+                .collect();
+
+            if !unconfirmed.is_empty() {
+                log::debug!(
+                    "top: verifying {} branches against GitHub API",
+                    unconfirmed.len()
+                );
+                let confirmed = verify_missing_branches(&git, &unconfirmed).await;
+                if !confirmed.is_empty() {
+                    let set = open_branches.get_or_insert_with(HashSet::new);
+                    set.extend(confirmed);
+                }
+            }
+        }
 
         // Filter to active stacks only
         let (tops, roots): (Vec<_>, Vec<_>) = tops

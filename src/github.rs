@@ -51,7 +51,7 @@ impl GitHubClient {
     /// Fetch the first page of open PRs (up to 100). Sufficient for most repos.
     pub async fn get_open_pull_requests(&self) -> Result<Vec<PullRequest>> {
         log::debug!("Fetching open PRs for {}/{}", self.owner, self.repo);
-        let page = self
+        let mut page = self
             .octocrab
             .pulls(&self.owner, &self.repo)
             .list()
@@ -60,23 +60,31 @@ impl GitHubClient {
             .send()
             .await?;
 
-        Ok(page
-            .into_iter()
-            .map(|pr| PullRequest {
-                number: pr.number,
-                title: pr.title.unwrap_or_default(),
-                body: pr.body,
-                state: if pr.merged_at.is_some() {
-                    "merged".to_string()
-                } else {
-                    format!("{:?}", pr.state.unwrap()).to_lowercase()
-                },
-                head_ref: pr.head.ref_field,
-                base_ref: pr.base.ref_field,
-                html_url: pr.html_url.unwrap().to_string(),
-                draft: pr.draft.unwrap_or(false),
-            })
-            .collect())
+        let mut all_prs = Vec::new();
+        loop {
+            for pr in &page {
+                all_prs.push(PullRequest {
+                    number: pr.number,
+                    title: pr.title.clone().unwrap_or_default(),
+                    body: pr.body.clone(),
+                    state: if pr.merged_at.is_some() {
+                        "merged".to_string()
+                    } else {
+                        format!("{:?}", pr.state.clone().unwrap()).to_lowercase()
+                    },
+                    head_ref: pr.head.ref_field.clone(),
+                    base_ref: pr.base.ref_field.clone(),
+                    html_url: pr.html_url.clone().unwrap().to_string(),
+                    draft: pr.draft.unwrap_or(false),
+                });
+            }
+            page = match self.octocrab.get_page(&page.next).await? {
+                Some(next) => next,
+                None => break,
+            };
+        }
+        log::debug!("Fetched {} open PRs total", all_prs.len());
+        Ok(all_prs)
     }
 
     /// Fetch the most recent PR for a specific branch using the API's `head` filter.

@@ -5,7 +5,7 @@ use stax::cache::{CachedPullRequest, StackCache};
 use stax::commands::navigate::{
     build_commit_cache, build_parent_map, children_from_map, find_children, find_parent,
     get_branches_and_parent_map, get_branches_with_cache, is_active_stack, is_main_branch,
-    needs_restack, root_children_from_map, walk_to_top,
+    needs_restack, open_branches_from_cache, root_children_from_map, walk_to_top,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1635,4 +1635,57 @@ fn test_needs_restack_deep_stack_only_affected_branch() {
         !needs_restack(&repo, "C", &parent_map, &commits),
         "C doesn't need restacking because B hasn't moved"
     );
+}
+
+// ── open_branches_from_cache ────────────────────────────────────────────────
+
+#[test]
+fn test_open_branches_from_cache_no_cache() {
+    let (_, repo) = create_test_repo();
+    // No cache file — should return None
+    assert!(open_branches_from_cache(&repo).is_none());
+}
+
+#[test]
+fn test_open_branches_from_cache_returns_open_prs() {
+    let (dir, repo) = create_test_repo();
+    let p = dir.path();
+    create_branch_with_commit(p, "A", "main");
+    create_branch_with_commit(p, "B", "main");
+    create_branch_with_commit(p, "C", "main");
+
+    // Populate cache so it has branch data
+    get_branches_and_parent_map(&repo).unwrap();
+
+    // Write PR data: A is open, B is closed, C has no PR
+    let mut cache = StackCache::new(&repo.git_dir());
+    let mut prs = HashMap::new();
+    prs.insert(
+        "A".to_string(),
+        CachedPullRequest {
+            number: 1,
+            state: "open".to_string(),
+            head_ref: "A".to_string(),
+            base_ref: "main".to_string(),
+            html_url: "https://github.com/o/r/pull/1".to_string(),
+            draft: false,
+        },
+    );
+    prs.insert(
+        "B".to_string(),
+        CachedPullRequest {
+            number: 2,
+            state: "closed".to_string(),
+            head_ref: "B".to_string(),
+            base_ref: "main".to_string(),
+            html_url: "https://github.com/o/r/pull/2".to_string(),
+            draft: false,
+        },
+    );
+    cache.save_pull_requests(&prs);
+
+    let open = open_branches_from_cache(&repo).unwrap();
+    assert!(open.contains("A"), "A has an open PR");
+    assert!(!open.contains("B"), "B is closed");
+    assert!(!open.contains("C"), "C has no PR");
 }
