@@ -19,6 +19,8 @@ pub struct CacheFile {
     pub pull_requests: HashMap<String, CachedPullRequest>,
     #[serde(default)]
     pub shadow_branches: HashMap<String, ShadowBranch>,
+    #[serde(default)]
+    pub pr_refreshed_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -428,6 +430,7 @@ impl StackCache {
             branches,
             pull_requests,
             shadow_branches,
+            pr_refreshed_at: self.data.as_ref().and_then(|d| d.pr_refreshed_at),
         }
     }
 
@@ -446,6 +449,85 @@ impl StackCache {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         log::debug!("cache: saved {} pull requests", data.pull_requests.len());
+        self.save(&data);
+        self.data = Some(data);
+    }
+
+    /// Check whether the cached PR data is stale (older than `max_age_secs`).
+    /// Returns `false` if there is no cache at all (nothing to refresh).
+    pub fn pr_data_is_stale(&mut self, max_age_secs: u64) -> bool {
+        let data = match self.load() {
+            Some(d) => d,
+            None => return false,
+        };
+        match data.pr_refreshed_at {
+            None => true,
+            Some(ts) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                now.saturating_sub(ts) > max_age_secs
+            }
+        }
+    }
+
+    /// Merge incoming PR data into the cache, preserving local `base_ref`
+    /// overrides (e.g., from `stax insert` reparenting not yet submitted).
+    /// Unlike `save_pull_requests` which replaces the entire map, this
+    /// updates existing entries and adds new ones without removing cached
+    /// PRs that are absent from `incoming`.
+    pub fn merge_pull_requests(
+        &mut self,
+        incoming: &[CachedPullRequest],
+        local_branches: &HashSet<String>,
+    ) {
+        if self.load().is_none() {
+            log::debug!("cache: merge_pull_requests skipped — no existing cache");
+            return;
+        }
+        let mut data = self.data.take().unwrap();
+
+        for pr in incoming {
+            if !data.branches.contains_key(&pr.head_ref) {
+                continue;
+            }
+            let base_ref = if let Some(existing) = data.pull_requests.get(&pr.head_ref) {
+                if existing.base_ref != pr.base_ref && local_branches.contains(&existing.base_ref) {
+                    log::debug!(
+                        "cache: preserving local base_ref '{}' for '{}' (incoming: '{}')",
+                        existing.base_ref,
+                        pr.head_ref,
+                        pr.base_ref
+                    );
+                    existing.base_ref.clone()
+                } else {
+                    pr.base_ref.clone()
+                }
+            } else {
+                pr.base_ref.clone()
+            };
+            data.pull_requests.insert(
+                pr.head_ref.clone(),
+                CachedPullRequest {
+                    base_ref,
+                    number: pr.number,
+                    state: pr.state.clone(),
+                    head_ref: pr.head_ref.clone(),
+                    html_url: pr.html_url.clone(),
+                    draft: pr.draft,
+                },
+            );
+        }
+
+        data.pr_refreshed_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+
+        log::debug!("cache: merged PRs, {} total", data.pull_requests.len());
         self.save(&data);
         self.data = Some(data);
     }
@@ -654,6 +736,7 @@ mod tests {
             branches,
             pull_requests: HashMap::new(),
             shadow_branches: HashMap::new(),
+            pr_refreshed_at: None,
         }
     }
 
@@ -1105,5 +1188,209 @@ mod tests {
         let dir = make_git_dir();
         let cache = StackCache::new(dir.path());
         assert!(cache.load_restack_state().is_none());
+    }
+
+    // ── merge_pull_requests ─────────────────────────────────────────────
+
+    fn make_pr(head: &str, base: &str, number: u64) -> CachedPullRequest {
+        CachedPullRequest {
+            number,
+            state: "open".to_string(),
+            head_ref: head.to_string(),
+            base_ref: base.to_string(),
+            html_url: format!("https://github.com/o/r/pull/{number}"),
+            draft: false,
+        }
+    }
+
+    #[test]
+    fn test_merge_preserves_local_override() {
+        let dir = make_git_dir();
+        let mut data = sample_cache_data();
+        // Existing cache says feature-a's base is "feature-b" (local override)
+        data.pull_requests.insert(
+            "feature-a".to_string(),
+            make_pr("feature-a", "feature-b", 1),
+        );
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        // Incoming from API says base is "main"
+        let incoming = vec![make_pr("feature-a", "main", 1)];
+        // "feature-b" is a valid local branch
+        let local: HashSet<String> = ["main", "feature-a", "feature-b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut cache2 = StackCache::new(dir.path());
+        cache2.merge_pull_requests(&incoming, &local);
+
+        let mut cache3 = StackCache::new(dir.path());
+        let loaded = cache3.load().unwrap();
+        assert_eq!(
+            loaded.pull_requests["feature-a"].base_ref, "feature-b",
+            "local override should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_merge_adds_new_prs() {
+        let dir = make_git_dir();
+        let data = sample_cache_data(); // has feature-a and feature-b branches, no PRs
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        let incoming = vec![make_pr("feature-a", "main", 10)];
+        let local: HashSet<String> = ["main", "feature-a"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let mut cache2 = StackCache::new(dir.path());
+        cache2.merge_pull_requests(&incoming, &local);
+
+        let mut cache3 = StackCache::new(dir.path());
+        let loaded = cache3.load().unwrap();
+        assert_eq!(loaded.pull_requests.len(), 1);
+        assert_eq!(loaded.pull_requests["feature-a"].number, 10);
+    }
+
+    #[test]
+    fn test_merge_updates_state() {
+        let dir = make_git_dir();
+        let mut data = sample_cache_data();
+        data.pull_requests
+            .insert("feature-a".to_string(), make_pr("feature-a", "main", 5));
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        let mut incoming_pr = make_pr("feature-a", "main", 5);
+        incoming_pr.state = "closed".to_string();
+        let incoming = vec![incoming_pr];
+        let local: HashSet<String> = ["main"].iter().map(|s| s.to_string()).collect();
+
+        let mut cache2 = StackCache::new(dir.path());
+        cache2.merge_pull_requests(&incoming, &local);
+
+        let mut cache3 = StackCache::new(dir.path());
+        let loaded = cache3.load().unwrap();
+        assert_eq!(loaded.pull_requests["feature-a"].state, "closed");
+    }
+
+    #[test]
+    fn test_merge_drops_invalid_override() {
+        let dir = make_git_dir();
+        let mut data = sample_cache_data();
+        // Cached base_ref points to a branch that no longer exists locally
+        data.pull_requests.insert(
+            "feature-a".to_string(),
+            make_pr("feature-a", "deleted-branch", 1),
+        );
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        let incoming = vec![make_pr("feature-a", "main", 1)];
+        // "deleted-branch" is NOT in local branches
+        let local: HashSet<String> = ["main"].iter().map(|s| s.to_string()).collect();
+
+        let mut cache2 = StackCache::new(dir.path());
+        cache2.merge_pull_requests(&incoming, &local);
+
+        let mut cache3 = StackCache::new(dir.path());
+        let loaded = cache3.load().unwrap();
+        assert_eq!(
+            loaded.pull_requests["feature-a"].base_ref, "main",
+            "invalid override should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_merge_no_cache_is_noop() {
+        let dir = make_git_dir();
+        let incoming = vec![make_pr("feature-a", "main", 1)];
+        let local: HashSet<String> = ["main"].iter().map(|s| s.to_string()).collect();
+
+        // No cache file exists — should not panic
+        let mut cache = StackCache::new(dir.path());
+        cache.merge_pull_requests(&incoming, &local);
+    }
+
+    #[test]
+    fn test_merge_filters_unknown_branches() {
+        let dir = make_git_dir();
+        let data = sample_cache_data(); // branches: feature-a, feature-b
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        // PR for a branch not in the cache's branch list
+        let incoming = vec![make_pr("unknown-branch", "main", 99)];
+        let local: HashSet<String> = ["main"].iter().map(|s| s.to_string()).collect();
+
+        let mut cache2 = StackCache::new(dir.path());
+        cache2.merge_pull_requests(&incoming, &local);
+
+        let mut cache3 = StackCache::new(dir.path());
+        let loaded = cache3.load().unwrap();
+        assert!(
+            loaded.pull_requests.is_empty(),
+            "unknown branches should be filtered"
+        );
+    }
+
+    #[test]
+    fn test_merge_updates_timestamp() {
+        let dir = make_git_dir();
+        let data = sample_cache_data();
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        let incoming = vec![make_pr("feature-a", "main", 1)];
+        let local: HashSet<String> = ["main"].iter().map(|s| s.to_string()).collect();
+
+        let mut cache2 = StackCache::new(dir.path());
+        cache2.merge_pull_requests(&incoming, &local);
+
+        let mut cache3 = StackCache::new(dir.path());
+        let loaded = cache3.load().unwrap();
+        assert!(
+            loaded.pr_refreshed_at.is_some(),
+            "timestamp should be set after merge"
+        );
+    }
+
+    #[test]
+    fn test_pr_data_is_stale_no_cache() {
+        let dir = make_git_dir();
+        let mut cache = StackCache::new(dir.path());
+        assert!(!cache.pr_data_is_stale(300), "no cache means not stale");
+    }
+
+    #[test]
+    fn test_pr_data_is_stale_never_refreshed() {
+        let dir = make_git_dir();
+        let data = sample_cache_data(); // pr_refreshed_at: None
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        let mut cache2 = StackCache::new(dir.path());
+        assert!(cache2.pr_data_is_stale(300), "None timestamp means stale");
+    }
+
+    #[test]
+    fn test_pr_data_is_stale_recent() {
+        let dir = make_git_dir();
+        let mut data = sample_cache_data();
+        data.pr_refreshed_at = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
+        let cache = StackCache::new(dir.path());
+        cache.save(&data);
+
+        let mut cache2 = StackCache::new(dir.path());
+        assert!(!cache2.pr_data_is_stale(300), "just refreshed is not stale");
     }
 }

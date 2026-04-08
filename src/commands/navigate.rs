@@ -1307,6 +1307,37 @@ pub async fn bottom() -> Result<()> {
     Ok(())
 }
 
+/// Spawn a detached background process to refresh cached PR data if the
+/// cache is stale (> 5 minutes since last refresh).  The child process
+/// outlives the parent — zero latency impact on the current command.
+pub fn maybe_spawn_cache_refresh(git: &GitRepo) {
+    let mut cache = StackCache::new(&git.git_dir());
+    if !cache.pr_data_is_stale(300) {
+        return;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    match std::process::Command::new(exe)
+        .arg("cache-refresh")
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(_) => log::debug!("spawned background cache-refresh process"),
+        Err(e) => log::debug!("failed to spawn cache-refresh: {e}"),
+    }
+}
+
 /// Build the set of branches with open PRs from cached data.
 pub fn open_branches_from_cache(git: &GitRepo) -> Option<HashSet<String>> {
     let mut cache = StackCache::new(&git.git_dir());
@@ -1386,6 +1417,7 @@ pub async fn top() -> Result<()> {
     log::debug!("navigate top: current='{}'", current);
 
     let (branches, commits, merged, parent_map) = get_branches_and_parent_map(&git)?;
+    maybe_spawn_cache_refresh(&git);
 
     let ctx = BranchContext {
         git: &git,

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod branch;
+pub mod cache_refresh;
 pub mod config;
 pub mod include;
 pub mod insert;

@@ -297,6 +297,7 @@ fn test_cache_shadow_roundtrip() {
         branches,
         pull_requests: HashMap::new(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
     cache.save(&data);
 
@@ -353,6 +354,7 @@ fn test_cache_merge_sources_serialization() {
         branches,
         pull_requests: HashMap::new(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
 
     let cache = StackCache::new(dir.path());
@@ -591,6 +593,7 @@ fn test_dissolve_one_source_merged_rebases_consumer() {
         )]
         .into_iter()
         .collect(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -690,6 +693,7 @@ fn test_dissolve_all_sources_merged_reparents_to_trunk() {
         )]
         .into_iter()
         .collect(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -779,6 +783,7 @@ fn test_dissolve_partial_recreates_shadow_with_remaining() {
         )]
         .into_iter()
         .collect(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -888,6 +893,7 @@ fn test_shadow_injected_into_parent_map() {
         )]
         .into_iter()
         .collect(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);

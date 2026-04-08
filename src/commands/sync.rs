@@ -139,58 +139,26 @@ async fn refresh_metadata(git: &GitRepo) -> Result<()> {
     let _ = get_branches_and_parent_map(git)?;
     log::debug!("sync: branch parent cache refreshed");
 
-    // 2. Fetch fresh PR data from GitHub and persist to cache
+    // 2. Fetch fresh PR data from GitHub and merge into cache
     if let Some(token) = token_store::get_token() {
         if let Some(remote_url) = git.get_remote_url("origin") {
             if let Ok(github) = GitHubClient::new(&token, &remote_url) {
                 if let Ok(open_prs) = github.get_open_pull_requests().await {
-                    let all_branches = git.get_branches()?;
-
-                    // Preserve locally-modified base_refs (e.g., from `stax insert`)
-                    let local_pr_bases: HashMap<String, String> = {
-                        let mut c = StackCache::new(&git.git_dir());
-                        c.load();
-                        c.data_ref()
-                            .map(|d| {
-                                d.pull_requests
-                                    .iter()
-                                    .map(|(k, v)| (k.clone(), v.base_ref.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    };
-
-                    let cached_prs: HashMap<String, CachedPullRequest> = open_prs
+                    let incoming: Vec<CachedPullRequest> = open_prs
                         .iter()
-                        .map(|pr| {
-                            let base_ref = if let Some(local_base) =
-                                local_pr_bases.get(&pr.head_ref)
-                            {
-                                if *local_base != pr.base_ref && all_branches.contains(local_base) {
-                                    local_base.clone()
-                                } else {
-                                    pr.base_ref.clone()
-                                }
-                            } else {
-                                pr.base_ref.clone()
-                            };
-                            (
-                                pr.head_ref.clone(),
-                                CachedPullRequest {
-                                    number: pr.number,
-                                    state: pr.state.clone(),
-                                    head_ref: pr.head_ref.clone(),
-                                    base_ref,
-                                    html_url: pr.html_url.clone(),
-                                    draft: pr.draft,
-                                },
-                            )
+                        .map(|pr| CachedPullRequest {
+                            number: pr.number,
+                            state: pr.state.clone(),
+                            head_ref: pr.head_ref.clone(),
+                            base_ref: pr.base_ref.clone(),
+                            html_url: pr.html_url.clone(),
+                            draft: pr.draft,
                         })
                         .collect();
-
+                    let branch_set: HashSet<String> = git.get_branches()?.into_iter().collect();
                     let mut cache = StackCache::new(&git.git_dir());
-                    cache.save_pull_requests(&cached_prs);
-                    log::debug!("sync: saved {} PRs to cache", cached_prs.len());
+                    cache.merge_pull_requests(&incoming, &branch_set);
+                    log::debug!("sync: merged {} PRs into cache", incoming.len());
 
                     // Re-run parent computation so PR overrides take effect
                     let _ = get_branches_and_parent_map(git)?;
@@ -583,38 +551,43 @@ async fn build_stack_with_live_prs(
     // Fetch live PRs (including merged/closed state) for branch cleanup decisions
     let mut prs: HashMap<String, PullRequest> = HashMap::new();
     if let Ok(open_prs) = github.get_open_pull_requests().await {
-        // Load existing cached PR data to detect local modifications
-        // (e.g., from `stax insert` reparenting that hasn't been submitted yet)
-        let local_pr_bases: HashMap<String, String> = {
-            let mut c = StackCache::new(&git.git_dir());
-            c.load();
-            c.data_ref()
-                .map(|d| {
-                    d.pull_requests
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.base_ref.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        // Merge live PR data into cache (preserves local base_ref overrides)
+        let incoming: Vec<CachedPullRequest> = open_prs
+            .iter()
+            .map(|pr| CachedPullRequest {
+                number: pr.number,
+                state: pr.state.clone(),
+                head_ref: pr.head_ref.clone(),
+                base_ref: pr.base_ref.clone(),
+                html_url: pr.html_url.clone(),
+                draft: pr.draft,
+            })
+            .collect();
+        let branch_set: HashSet<String> = branches.iter().cloned().collect();
+        let mut cache = StackCache::new(&git.git_dir());
+        cache.merge_pull_requests(&incoming, &branch_set);
+
+        // Read back effective base_refs from merged cache
+        let effective_bases: HashMap<String, String> = cache
+            .data_ref()
+            .map(|d| {
+                d.pull_requests
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.base_ref.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         for mut pr in open_prs {
-            // If the cached base_ref differs from live AND exists as a local branch,
-            // preserve the cached version — it represents a local reparent (e.g.,
-            // from `stax insert`) that hasn't been submitted to GitHub yet.
-            if let Some(local_base) = local_pr_bases.get(&pr.head_ref) {
-                if *local_base != pr.base_ref && branches.contains(local_base) {
-                    log::debug!(
-                        "sync: preserving local base_ref '{}' for '{}' (live: '{}')",
-                        local_base,
-                        pr.head_ref,
-                        pr.base_ref
-                    );
-                    pr.base_ref = local_base.clone();
+            // Apply effective base_ref from cache (preserves local overrides
+            // from `stax insert` that haven't been submitted yet)
+            if let Some(effective_base) = effective_bases.get(&pr.head_ref) {
+                if *effective_base != pr.base_ref && branches.contains(effective_base) {
+                    pr.base_ref = effective_base.clone();
                 }
             }
 
-            // Apply PR base_ref overrides
+            // Apply PR base_ref overrides to parent map
             if parent_map.contains_key(&pr.head_ref) && branches.contains(&pr.base_ref) {
                 let current = parent_map.get(&pr.head_ref).and_then(|p| p.as_ref());
                 if current != Some(&pr.base_ref) {
@@ -630,26 +603,6 @@ async fn build_stack_with_live_prs(
             }
             prs.insert(pr.head_ref.clone(), pr);
         }
-
-        // Persist PR metadata to cache (with locally-modified base_refs preserved)
-        let cached_prs: HashMap<String, CachedPullRequest> = prs
-            .iter()
-            .map(|(k, pr)| {
-                (
-                    k.clone(),
-                    CachedPullRequest {
-                        number: pr.number,
-                        state: pr.state.clone(),
-                        head_ref: pr.head_ref.clone(),
-                        base_ref: pr.base_ref.clone(),
-                        html_url: pr.html_url.clone(),
-                        draft: pr.draft,
-                    },
-                )
-            })
-            .collect();
-        let mut cache = StackCache::new(&git.git_dir());
-        cache.save_pull_requests(&cached_prs);
     }
 
     // Also fetch PRs for branches that might be merged/closed (not in open PRs)

@@ -1,5 +1,5 @@
 use crate::cache::{CachedPullRequest, StackCache};
-use crate::commands::navigate::get_branches_and_parent_map;
+use crate::commands::navigate::{get_branches_and_parent_map, maybe_spawn_cache_refresh};
 use crate::git::GitRepo;
 use crate::github::{GitHubClient, PullRequest};
 use crate::stack::Stack;
@@ -26,6 +26,7 @@ pub async fn run() -> Result<()> {
 
     let prs: HashMap<String, PullRequest> = if !cached_prs.is_empty() {
         log::debug!("stack: using {} cached PRs for display", cached_prs.len());
+        maybe_spawn_cache_refresh(&git);
         cached_prs
             .values()
             .map(|cpr| {
@@ -52,23 +53,19 @@ pub async fn run() -> Result<()> {
             if let Some(remote_url) = git.get_remote_url("origin") {
                 if let Ok(gh) = GitHubClient::new(&token, &remote_url) {
                     if let Ok(open_prs) = gh.get_open_pull_requests().await {
-                        let cached: HashMap<String, CachedPullRequest> = open_prs
+                        let incoming: Vec<CachedPullRequest> = open_prs
                             .iter()
-                            .map(|pr| {
-                                (
-                                    pr.head_ref.clone(),
-                                    CachedPullRequest {
-                                        number: pr.number,
-                                        state: pr.state.clone(),
-                                        head_ref: pr.head_ref.clone(),
-                                        base_ref: pr.base_ref.clone(),
-                                        html_url: pr.html_url.clone(),
-                                        draft: pr.draft,
-                                    },
-                                )
+                            .map(|pr| CachedPullRequest {
+                                number: pr.number,
+                                state: pr.state.clone(),
+                                head_ref: pr.head_ref.clone(),
+                                base_ref: pr.base_ref.clone(),
+                                html_url: pr.html_url.clone(),
+                                draft: pr.draft,
                             })
                             .collect();
-                        cache.save_pull_requests(&cached);
+                        let branch_set: HashSet<String> = branches.iter().cloned().collect();
+                        cache.merge_pull_requests(&incoming, &branch_set);
 
                         for pr in open_prs {
                             fetched.insert(pr.head_ref.clone(), pr);

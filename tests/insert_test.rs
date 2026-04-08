@@ -40,6 +40,7 @@ fn setup_cache(
         branches,
         pull_requests: HashMap::new(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(git_dir);
     cache.save(&data);
@@ -299,6 +300,7 @@ fn test_insert_below_diamond_consumer_guard() {
         )]
         .into_iter()
         .collect(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -404,6 +406,7 @@ fn test_insert_above_diamond_child_updates_sources() {
         )]
         .into_iter()
         .collect(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -669,6 +672,7 @@ async fn test_insert_below_updates_cached_pr_base() {
         .into_iter()
         .collect(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -754,6 +758,7 @@ async fn test_insert_above_updates_cached_pr_base_for_children() {
         .into_iter()
         .collect(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -827,6 +832,7 @@ async fn test_insert_below_consistent_with_get_branches_and_parent_map() {
         .into_iter()
         .collect(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);
@@ -982,6 +988,7 @@ async fn test_insert_above_existing_updates_pr_base() {
         .into_iter()
         .collect(),
         shadow_branches: HashMap::new(),
+        pr_refreshed_at: None,
     };
     let cache = StackCache::new(&git_dir);
     cache.save(&data);

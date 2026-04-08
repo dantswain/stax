@@ -105,6 +105,8 @@ enum Commands {
         )]
         lines: usize,
     },
+    #[command(hide = true)]
+    CacheRefresh,
 }
 
 #[derive(Subcommand)]
@@ -177,6 +179,7 @@ async fn main() {
             ConfigCommands::List => commands::config::list().await,
         },
         Commands::Log { follow, lines } => commands::log::run(follow, lines).await,
+        Commands::CacheRefresh => commands::cache_refresh::run().await,
     };
 
     if let Err(e) = result {
