@@ -39,7 +39,12 @@ impl GitHubClient {
     }
 
     pub async fn get_authenticated_user(&self) -> Result<String> {
-        let user = self.octocrab.current().user().await?;
+        let user = self.octocrab.current().user().await.map_err(|e| {
+            anyhow!(
+                "Failed to fetch authenticated user: {}",
+                format_github_error(e)
+            )
+        })?;
         Ok(user.login)
     }
 
@@ -48,41 +53,57 @@ impl GitHubClient {
         oauth_client.authenticate().await
     }
 
-    /// Fetch the first page of open PRs (up to 100). Sufficient for most repos.
+    /// Fetch all open PRs, paginating with explicit page numbers.
+    /// (octocrab 0.34's get_page does not re-attach auth headers on the next-link request.)
     pub async fn get_open_pull_requests(&self) -> Result<Vec<PullRequest>> {
         log::debug!("Fetching open PRs for {}/{}", self.owner, self.repo);
-        let mut page = self
-            .octocrab
-            .pulls(&self.owner, &self.repo)
-            .list()
-            .state(octocrab::params::State::Open)
-            .per_page(100)
-            .send()
-            .await?;
-
         let mut all_prs = Vec::new();
+        let mut page_num: u8 = 1;
+
         loop {
-            for pr in &page {
+            let page = self
+                .octocrab
+                .pulls(&self.owner, &self.repo)
+                .list()
+                .state(octocrab::params::State::Open)
+                .per_page(100)
+                .page(page_num)
+                .send()
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "Failed to fetch PRs for {}/{} (page {}): {}",
+                        self.owner,
+                        self.repo,
+                        page_num,
+                        format_github_error(e)
+                    )
+                })?;
+
+            let has_next = page.next.is_some();
+            for pr in page.items {
                 all_prs.push(PullRequest {
                     number: pr.number,
-                    title: pr.title.clone().unwrap_or_default(),
-                    body: pr.body.clone(),
+                    title: pr.title.unwrap_or_default(),
+                    body: pr.body,
                     state: if pr.merged_at.is_some() {
                         "merged".to_string()
                     } else {
-                        format!("{:?}", pr.state.clone().unwrap()).to_lowercase()
+                        format!("{:?}", pr.state.unwrap()).to_lowercase()
                     },
-                    head_ref: pr.head.ref_field.clone(),
-                    base_ref: pr.base.ref_field.clone(),
-                    html_url: pr.html_url.clone().unwrap().to_string(),
+                    head_ref: pr.head.ref_field,
+                    base_ref: pr.base.ref_field,
+                    html_url: pr.html_url.unwrap().to_string(),
                     draft: pr.draft.unwrap_or(false),
                 });
             }
-            page = match self.octocrab.get_page(&page.next).await? {
-                Some(next) => next,
-                None => break,
-            };
+
+            if !has_next {
+                break;
+            }
+            page_num += 1;
         }
+
         log::debug!("Fetched {} open PRs total", all_prs.len());
         Ok(all_prs)
     }
@@ -99,7 +120,14 @@ impl GitHubClient {
             .head(format!("{}:{}", self.owner, branch))
             .per_page(5)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to fetch PR for branch '{}': {}",
+                    branch,
+                    format_github_error(e)
+                )
+            })?;
 
         let mut prs: Vec<PullRequest> = page
             .into_iter()
@@ -212,7 +240,8 @@ impl GitHubClient {
             .update(number)
             .state(octocrab::params::pulls::State::Closed)
             .send()
-            .await?;
+            .await
+            .map_err(|e| anyhow!("Failed to close PR #{}: {}", number, format_github_error(e)))?;
         Ok(())
     }
 
@@ -224,7 +253,14 @@ impl GitHubClient {
             .list_comments(pr_number)
             .per_page(100)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to list comments on PR #{}: {}",
+                    pr_number,
+                    format_github_error(e)
+                )
+            })?;
 
         Ok(page
             .items
@@ -238,7 +274,14 @@ impl GitHubClient {
         self.octocrab
             .issues(&self.owner, &self.repo)
             .create_comment(pr_number, body)
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to create comment on PR #{}: {}",
+                    pr_number,
+                    format_github_error(e)
+                )
+            })?;
         Ok(())
     }
 
@@ -247,13 +290,21 @@ impl GitHubClient {
         self.octocrab
             .issues(&self.owner, &self.repo)
             .update_comment(comment_id.into(), body)
-            .await?;
+            .await
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to update comment #{}: {}",
+                    comment_id,
+                    format_github_error(e)
+                )
+            })?;
         Ok(())
     }
 }
 
 /// Extract a useful error message from octocrab errors.
-/// Octocrab's `Error::GitHub` Display just prints "GitHub" without the message.
+/// octocrab's `Error::GitHub` Display impl prints only "GitHub" (the variant name),
+/// not the actual API message — always go through this function.
 fn format_github_error(err: octocrab::Error) -> String {
     match err {
         octocrab::Error::GitHub { source, .. } => source.to_string(),
