@@ -103,7 +103,9 @@ pub async fn run(
     // 7. Restack
     if !no_restack {
         log::debug!("sync: restacking branches");
-        restack_branches(&git, &config, &github, &original_branch).await?;
+        let merged_names: std::collections::HashSet<String> =
+            merged.iter().map(|(n, _)| n.clone()).collect();
+        restack_branches(&git, &config, &github, &original_branch, &merged_names).await?;
     } else {
         log::debug!("sync: skipping restack (--no-restack)");
     }
@@ -294,10 +296,11 @@ async fn restack_branches(
     _config: &Config,
     github: &GitHubClient,
     original_branch: &str,
+    merged_branches: &HashSet<String>,
 ) -> Result<()> {
     // Fresh start — clear any stale restack state from a previous aborted run
     StackCache::new(&git.git_dir()).clear_restack_state();
-    restack_all(git, Some(github), original_branch).await
+    restack_all(git, Some(github), original_branch, merged_branches).await
 }
 
 /// Shared restack logic used by both normal sync and --continue.
@@ -306,6 +309,7 @@ async fn restack_all(
     git: &GitRepo,
     _github: Option<&GitHubClient>,
     current_branch: &str,
+    merged_branches: &HashSet<String>,
 ) -> Result<()> {
     let (branches, commits, merged_set, parent_map) = get_branches_and_parent_map(git)?;
     let stack = Stack::from_parent_map(
@@ -365,6 +369,15 @@ async fn restack_all(
         if !restack_scope.contains(&branch.name) {
             continue;
         }
+        // Skip branches whose PRs are already merged/closed — their local branch
+        // may not be deleted yet (user declined cleanup) but rebasing them is wrong.
+        if merged_branches.contains(&branch.name) {
+            log::debug!(
+                "restack_all: skipping '{}' — PR is merged/closed",
+                branch.name
+            );
+            continue;
+        }
         if let Some(parent) = &branch.parent {
             let depth = branch_depth(&stack, &branch.name);
             to_rebase.push((branch.name.clone(), parent.clone(), depth));
@@ -388,12 +401,22 @@ async fn restack_all(
         let persisted = cache.load_restack_state();
         let mut tips = persisted.map(|s| s.old_tips).unwrap_or_default();
         let had_persisted = !tips.is_empty();
+        // Always populate tips for branches in the restack plan
         for (branch, parent, _) in &to_rebase {
             for name in [branch, parent] {
                 if !tips.contains_key(name) {
                     if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{name}")) {
                         tips.insert(name.clone(), hash);
                     }
+                }
+            }
+        }
+        // Also capture tips for ALL branches so we can detect stacked commits
+        // from branches not directly in the restack plan (e.g. merged-but-not-deleted parents).
+        for branch_name in &branches {
+            if !tips.contains_key(branch_name) {
+                if let Ok(hash) = git.get_commit_hash(&format!("refs/heads/{branch_name}")) {
+                    tips.insert(branch_name.clone(), hash);
                 }
             }
         }
@@ -415,6 +438,7 @@ async fn restack_all(
     cache.save_restack_state(&RestackState {
         old_tips: old_tips.clone(),
         original_branch: current_branch.to_string(),
+        merged_branches: merged_branches.iter().cloned().collect(),
     });
 
     // Load shadow branch data for recreating shadows during restack
@@ -464,12 +488,50 @@ async fn restack_all(
             }
         }
         utils::print_info(&format!("Rebasing '{branch}' onto '{parent}'"));
-        // Use the parent's pre-rebase tip so --onto only replays branch's own commits
-        let old_parent_tip = old_tips.get(parent).map(|s| s.as_str());
+        // Determine the correct --onto upstream for this rebase.
+        //
+        // The goal is to replay only this branch's *own* commits, not commits
+        // that belong to the parent (or any earlier branch in the stack).
+        //
+        // Normal case: old_tips[parent] is the parent's tip before it was
+        // rebased in this run. Using it as the upstream correctly strips the
+        // parent's old commits from the branch being rebased.
+        //
+        // Broken case: if the parent was rebased *outside* this sync run
+        // (e.g. manually, or by a prior aborted run), old_tips[parent] is
+        // already the post-rebase tip and is NOT in this branch's ancestry.
+        // In that case we fall back to the reflog-based fork-point, which
+        // finds the commit where this branch actually diverged from the parent.
+        //
+        // Trunk case: when the parent is main/master/develop, also check if
+        // any other tracked branch's tip is an ancestor — that signals a
+        // previously-merged parent whose commits are still in this branch's
+        // history and must not be replayed onto trunk.
+        let old_parent_tip = if main_branches.contains(&parent.as_str()) {
+            find_deepest_ancestor_tip(git, branch, &old_tips, &main_branches)
+                .or_else(|| old_tips.get(parent).cloned())
+        } else {
+            match old_tips.get(parent).cloned() {
+                Some(tip) if git.is_commit_ancestor_of_branch(&tip, branch) => Some(tip),
+                Some(_) => {
+                    // Parent was externally rebased; its current tip is not in
+                    // this branch's ancestry. Use the reflog fork-point instead.
+                    let fp = git.get_fork_point(parent, branch);
+                    log::debug!(
+                        "restack_all: old_tips['{parent}'] not ancestor of '{branch}'; \
+                         fork-point = {:?}",
+                        fp
+                    );
+                    fp
+                }
+                None => None,
+            }
+        };
+        let old_parent_tip_ref = old_parent_tip.as_deref();
         match git.rebase_onto_with_base(
             branch,
             parent,
-            old_parent_tip,
+            old_parent_tip_ref,
             Some("stax sync --continue"),
         ) {
             Ok(()) => restacked.push(branch.as_str()),
@@ -485,6 +547,55 @@ async fn restack_all(
     }
 
     Ok(())
+}
+
+/// When rebasing a branch onto trunk, find the deepest non-trunk branch tip
+/// from `all_tips` that is an ancestor of `branch`. Using this as the `--onto`
+/// upstream ensures only the branch's own unique commits are replayed, stripping
+/// any stacked commits from an intermediate branch (e.g. a merged parent that
+/// wasn't deleted yet).
+///
+/// "Deepest" means closest to the branch tip: a candidate A is preferred over B
+/// if A is a descendant of B (A is higher in the stack).
+fn find_deepest_ancestor_tip(
+    git: &GitRepo,
+    branch: &str,
+    all_tips: &HashMap<String, String>,
+    main_branches: &[&str],
+) -> Option<String> {
+    // Collect all non-trunk branch tips that are ancestors of `branch`
+    let candidates: Vec<(String, String)> = all_tips
+        .iter()
+        .filter(|(name, tip)| {
+            name.as_str() != branch
+                && !main_branches.contains(&name.as_str())
+                && git.is_commit_ancestor_of_branch(tip, branch)
+        })
+        .map(|(name, tip)| (name.clone(), tip.clone()))
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Among candidates, find the deepest one: the tip that is NOT an ancestor
+    // of any other candidate's tip (i.e., no other candidate is a descendant of it).
+    let deepest = candidates.iter().find(|(_, tip)| {
+        !candidates
+            .iter()
+            .any(|(_, other)| other != tip && git.is_commit_ancestor_of_commit(tip, other))
+    });
+
+    let result = deepest.or_else(|| candidates.first()).map(|(name, tip)| {
+        log::debug!(
+            "find_deepest_ancestor_tip: using '{}' tip ({}) as upstream for rebasing '{}'",
+            name,
+            &tip[..8],
+            branch
+        );
+        tip.clone()
+    });
+    result
 }
 
 /// Continue a sync after the user has resolved rebase or merge conflicts.
@@ -529,7 +640,13 @@ async fn continue_after_conflicts(git: &GitRepo, _config: &Config) -> Result<()>
 
     // Re-analyze and restack remaining branches (scoped to current stack)
     let current_branch = git.current_branch()?;
-    restack_all(git, None, &current_branch).await?;
+    let merged_branches: HashSet<String> = {
+        let c = StackCache::new(&git.git_dir());
+        c.load_restack_state()
+            .map(|s| s.merged_branches.into_iter().collect())
+            .unwrap_or_default()
+    };
+    restack_all(git, None, &current_branch, &merged_branches).await?;
 
     // Refresh cache after conflict resolution and restacking
     log::debug!("sync: refreshing cache after --continue");

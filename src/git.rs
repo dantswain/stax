@@ -283,6 +283,60 @@ impl GitRepo {
         Ok(mb)
     }
 
+    /// Returns true if `commit_hash` is an ancestor of (or equal to) the tip of `branch_name`.
+    pub fn is_commit_ancestor_of_branch(&self, commit_hash: &str, branch_name: &str) -> bool {
+        let Ok(ancestor_oid) = Oid::from_str(commit_hash) else {
+            return false;
+        };
+        let Ok(branch_oid) = self.resolve_oid(branch_name) else {
+            return false;
+        };
+        if ancestor_oid == branch_oid {
+            return true;
+        }
+        self.repo
+            .graph_descendant_of(branch_oid, ancestor_oid)
+            .unwrap_or(false)
+    }
+
+    /// Returns true if `ancestor_hash` is an ancestor of (or equal to) `descendant_hash`.
+    pub fn is_commit_ancestor_of_commit(&self, ancestor_hash: &str, descendant_hash: &str) -> bool {
+        let Ok(ancestor_oid) = Oid::from_str(ancestor_hash) else {
+            return false;
+        };
+        let Ok(descendant_oid) = Oid::from_str(descendant_hash) else {
+            return false;
+        };
+        if ancestor_oid == descendant_oid {
+            return true;
+        }
+        self.repo
+            .graph_descendant_of(descendant_oid, ancestor_oid)
+            .unwrap_or(false)
+    }
+
+    /// Returns the fork point of `branch` from `upstream` using reflog information.
+    /// Equivalent to `git merge-base --fork-point <upstream> <branch>`.
+    /// Returns None if git cannot determine a fork point.
+    pub fn get_fork_point(&self, upstream: &str, branch: &str) -> Option<String> {
+        let workdir = self.workdir().ok()?;
+        let output = std::process::Command::new("git")
+            .args(["merge-base", "--fork-point", upstream, branch])
+            .current_dir(workdir)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let hash = String::from_utf8(output.stdout).ok()?.trim().to_string();
+            if !hash.is_empty() {
+                Some(hash)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     /// Count commits reachable from `to` but not from `from`.
     /// Equivalent to `git rev-list --count from..to`.
     pub fn count_commits_between(&self, from: &str, to: &str) -> Result<usize> {

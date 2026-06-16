@@ -71,6 +71,10 @@ pub struct RestackState {
     pub old_tips: HashMap<String, String>,
     /// The branch the user was on when the restack started.
     pub original_branch: String,
+    /// Branches whose GitHub PRs are merged/closed — skipped during restack
+    /// even if the local branch hasn't been deleted yet.
+    #[serde(default)]
+    pub merged_branches: Vec<String>,
 }
 
 /// Persisted state for a shadow branch merge that hit conflicts.
@@ -1159,6 +1163,7 @@ mod tests {
         let state = RestackState {
             old_tips: old_tips.clone(),
             original_branch: "branch-b".to_string(),
+            merged_branches: Vec::new(),
         };
         cache.save_restack_state(&state);
 
@@ -1175,6 +1180,7 @@ mod tests {
         let state = RestackState {
             old_tips: HashMap::new(),
             original_branch: "main".to_string(),
+            merged_branches: Vec::new(),
         };
         cache.save_restack_state(&state);
         assert!(cache.load_restack_state().is_some());

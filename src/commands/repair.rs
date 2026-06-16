@@ -190,6 +190,7 @@ pub async fn do_repair(git: &GitRepo, check: bool, prs: &[PullRequest]) -> Resul
     cache.save_restack_state(&RestackState {
         old_tips: old_tips.clone(),
         original_branch: current_branch.clone(),
+        merged_branches: Vec::new(),
     });
 
     let mut repaired = Vec::new();

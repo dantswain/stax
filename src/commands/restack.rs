@@ -172,6 +172,7 @@ async fn do_restack(git: &GitRepo, all: bool) -> Result<()> {
     cache.save_restack_state(&RestackState {
         old_tips: old_tips.clone(),
         original_branch: current_branch.clone(),
+        merged_branches: Vec::new(),
     });
 
     let mut restacked = Vec::new();
